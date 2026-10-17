@@ -19,6 +19,10 @@
 static const uint32_t kCFMagic = 0x4D524643;   // "CFRM" little-endian
 static const uint8_t  kCFVersion = 0x01;
 static const uint8_t  kCFTypeJPEG = 0x01;
+static const uint8_t  kCFTypePCM  = 0x02;
+static const NSUInteger kCFAudioRate = 44100;
+static const NSUInteger kCFAudioCh   = 2;
+static const NSUInteger kCFAudioMaxBytes = kCFAudioRate * kCFAudioCh * 2;   // 缓冲 1 秒
 static const uint32_t kCFMaxPayload = 8u * 1024u * 1024u;   // 8MB 上限，防脏数据撑爆内存
 
 static BOOL cf_read_full(int fd, void *buf, size_t len) {
@@ -42,6 +46,10 @@ static BOOL cf_read_full(int fd, void *buf, size_t len) {
     NSUInteger _frames;
     BOOL _running;
     CGColorSpaceRef _rgb;
+
+    NSMutableData *_audioBuf;
+    os_unfair_lock _audioLock;
+    BOOL _gotAudio;
 }
 
 - (instancetype)initWithPort:(uint16_t)port {
@@ -50,6 +58,8 @@ static BOOL cf_read_full(int fd, void *buf, size_t len) {
         _listenFD = -1;
         _clientFD = -1;
         _lock = OS_UNFAIR_LOCK_INIT;
+        _audioLock = OS_UNFAIR_LOCK_INIT;
+        _audioBuf = [NSMutableData dataWithCapacity:kCFAudioMaxBytes];
         _state = [NSString stringWithFormat:@"直连: 等待 PC 连接 (端口 %u)", _port];
         _rgb = CGColorSpaceCreateDeviceRGB();
     }
@@ -127,6 +137,11 @@ static BOOL cf_read_full(int fd, void *buf, size_t len) {
     os_unfair_lock_lock(&_lock);
     if (_latest) { CVPixelBufferRelease(_latest); _latest = NULL; }
     os_unfair_lock_unlock(&_lock);
+
+    os_unfair_lock_lock(&_audioLock);
+    [_audioBuf setLength:0];
+    _gotAudio = NO;
+    os_unfair_lock_unlock(&_audioLock);
 }
 
 - (void)acceptLoop {
@@ -179,7 +194,9 @@ static BOOL cf_read_full(int fd, void *buf, size_t len) {
         NSMutableData *payload = [NSMutableData dataWithLength:len];
         if (!cf_read_full(fd, payload.mutableBytes, len)) return;
 
-        if (type == kCFTypeJPEG) {
+        if (type == kCFTypePCM) {
+            [self appendAudio:payload];
+        } else if (type == kCFTypeJPEG) {
             CVPixelBufferRef pb = [self pixelBufferFromJPEG:payload];
             if (pb) {
                 os_unfair_lock_lock(&_lock);
@@ -224,6 +241,46 @@ static BOOL cf_read_full(int fd, void *buf, size_t len) {
     CVPixelBufferUnlockBaseAddress(pb, 0);
     CGImageRelease(img);
     return pb;   // +1
+}
+
+#pragma mark - 音频
+
++ (NSUInteger)audioSampleRate { return kCFAudioRate; }
++ (NSUInteger)audioChannels { return kCFAudioCh; }
+
+- (BOOL)hasAudio {
+    os_unfair_lock_lock(&_audioLock);
+    BOOL has = _gotAudio;
+    os_unfair_lock_unlock(&_audioLock);
+    return has;
+}
+
+- (void)appendAudio:(NSData *)pcm {
+    if (pcm.length == 0) return;
+    os_unfair_lock_lock(&_audioLock);
+    [_audioBuf appendData:pcm];
+    if (_audioBuf.length > kCFAudioMaxBytes) {          // 只保留最近 1 秒，防 PC 推太快
+        NSUInteger drop = _audioBuf.length - kCFAudioMaxBytes;
+        [_audioBuf replaceBytesInRange:NSMakeRange(0, drop) withBytes:NULL length:0];
+    }
+    _gotAudio = YES;
+    os_unfair_lock_unlock(&_audioLock);
+}
+
+- (NSData *)takeAudioBytes:(NSUInteger)bytes {
+    if (bytes == 0) return nil;
+    os_unfair_lock_lock(&_audioLock);
+    NSData *out = nil;
+    if (_audioBuf.length >= bytes) {
+        out = [_audioBuf subdataWithRange:NSMakeRange(0, bytes)];
+        [_audioBuf replaceBytesInRange:NSMakeRange(0, bytes) withBytes:NULL length:0];
+    } else if (_audioBuf.length > 0) {
+        // 不够就让下游拿短的（会补静音），总比卡住强
+        out = [_audioBuf copy];
+        [_audioBuf setLength:0];
+    }
+    os_unfair_lock_unlock(&_audioLock);
+    return out;
 }
 
 #pragma mark - 出帧

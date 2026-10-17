@@ -36,12 +36,18 @@ import socket
 import struct
 import subprocess
 import sys
+import threading
 import time
 
 MAGIC = 0x4D524643          # "CFRM" little-endian
 VERSION = 0x01
 TYPE_JPEG = 0x01
+TYPE_PCM = 0x02
 HEADER = struct.Struct("<IBBH I")   # magic, version, type, resv, length
+
+AUDIO_RATE = 44100
+AUDIO_CH = 2
+AUDIO_CHUNK = int(AUDIO_RATE * AUDIO_CH * 2 * 0.02)   # 20ms = 1764 字节
 
 
 def log(msg):
@@ -63,8 +69,12 @@ def connect(host, port, retries=20, delay=0.5):
     sys.exit(1)
 
 
-def send_frame(sock, jpeg: bytes):
-    sock.sendall(HEADER.pack(MAGIC, VERSION, TYPE_JPEG, 0, len(jpeg)) + jpeg)
+def send_packet(sock, pkt: bytes):
+    sock.sendall(pkt)
+
+
+def make_packet(ptype: int, payload: bytes) -> bytes:
+    return HEADER.pack(MAGIC, VERSION, ptype, 0, len(payload)) + payload
 
 
 # ── 帧源：OpenCV ────────────────────────────────────────────────────────────
@@ -136,6 +146,52 @@ def frames_ffmpeg(src, camera, width, height, fps, quality):
         proc.kill()
 
 
+def read_exact(stream, n):
+    buf = b""
+    while len(buf) < n:
+        chunk = stream.read(n - len(buf))
+        if not chunk:
+            return buf or None
+        buf += chunk
+    return buf
+
+
+def audio_worker(sock, lock, path, stop_evt, loop=True):
+    """把输入文件的音轨转成 s16le/44.1k/2ch，按 20ms 一包推给手机"""
+    if not shutil.which("ffmpeg"):
+        log("没有 ffmpeg，跳过音频推送")
+        return
+    while not stop_evt.is_set():
+        proc = subprocess.Popen(
+            ["ffmpeg", "-loglevel", "error", "-i", path, "-vn",
+             "-ac", str(AUDIO_CH), "-ar", str(AUDIO_RATE), "-f", "s16le", "-"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0)
+        next_t = time.monotonic()
+        try:
+            while not stop_evt.is_set():
+                data = read_exact(proc.stdout, AUDIO_CHUNK)
+                if not data:
+                    break
+                with lock:
+                    send_packet(sock, make_packet(TYPE_PCM, data))
+                next_t += 0.02
+                dt = next_t - time.monotonic()
+                if dt > 0:
+                    time.sleep(dt)
+                else:
+                    next_t = time.monotonic()
+        except (BrokenPipeError, ConnectionResetError):
+            stop_evt.set()
+        finally:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        if not loop or stop_evt.is_set():
+            break
+        time.sleep(0.2)
+
+
 def main():
     ap = argparse.ArgumentParser(description="CamForge 直连推流（usbmuxd 通道）")
     ap.add_argument("source", nargs="?", help="视频文件路径（省略时配合 --camera）")
@@ -146,6 +202,7 @@ def main():
     ap.add_argument("--width", type=int, default=1280)
     ap.add_argument("--height", type=int, default=720)
     ap.add_argument("--quality", type=int, default=75, help="JPEG 质量 1-100")
+    ap.add_argument("--no-audio", action="store_true", help="不推音频（只推画面）")
     args = ap.parse_args()
 
     if not args.source and args.camera is None:
@@ -167,9 +224,19 @@ def main():
     sent = 0
     interval = 1.0 / args.fps if args.fps else 1 / 30
     t0 = time.time()
+    send_lock = threading.Lock()
+    stop_evt = threading.Event()
+
+    # 音频线程：只在推文件且没关音频时启动（摄像头模式没有音轨）
+    if args.source and not args.no_audio:
+        threading.Thread(target=audio_worker,
+                         args=(sock, send_lock, args.source, stop_evt),
+                         daemon=True).start()
+
     try:
         for jpeg in gen:
-            send_frame(sock, jpeg)
+            with send_lock:
+                send_packet(sock, make_packet(TYPE_JPEG, jpeg))
             sent += 1
             if sent % 30 == 0:
                 dt = time.time() - t0
@@ -184,6 +251,7 @@ def main():
     except KeyboardInterrupt:
         log(f"手动停止，共推 {sent} 帧")
     finally:
+        stop_evt.set()
         sock.close()
 
 

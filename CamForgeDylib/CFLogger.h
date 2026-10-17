@@ -16,6 +16,7 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic, readonly) NSUInteger passthroughFrames;///< 透传的真帧数
 @property (nonatomic, readonly) NSUInteger renderedFrames;   ///< 渲染线程产出的帧数
 @property (nonatomic, readonly) NSUInteger sessionsSeen;     ///< 见过的 session 数
+@property (nonatomic, readonly) NSUInteger directAudioFrames;  ///< 用推流音频替换的次数
 
 - (void)incVideoHookHit;
 - (void)incAudioHookHit;
@@ -23,6 +24,7 @@ NS_ASSUME_NONNULL_BEGIN
 - (void)incPassthrough;
 - (void)incRendered;
 - (void)incSession;
+- (void)incDirectAudio;
 
 /// 同时写 NSLog（设备 syslog / Console.app 可见）和内存事件流水
 - (void)log:(NSString *)format, ... NS_FORMAT_FUNCTION(1, 2);

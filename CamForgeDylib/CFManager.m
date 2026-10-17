@@ -26,6 +26,10 @@
 #import <math.h>
 #import <string.h>
 
+#if CF_HAVE_FFMPEG
+#import <libswresample/swresample.h>
+#endif
+
 /// 内容摘要（FNV-1a，抽样扫描；用于画面去重）
 static uint64_t cf_digest(CVPixelBufferRef pb) {
     if (!pb) return 0;
@@ -338,6 +342,39 @@ static BOOL cf_block_is_silent(CMBlockBufferRef block, size_t totalBytes) {
     return (CMSampleBufferRef)[self.jitter popRetained];   // +1 或 NULL
 }
 
+- (NSData *)convertPCM:(NSData *)pcm
+              fromRate:(int)srcRate fromCh:(int)srcCh
+                toRate:(int)dstRate toCh:(int)dstCh
+             wantBytes:(NSUInteger)want {
+    if (pcm.length == 0 || want == 0) return nil;
+    if (srcRate == dstRate && srcCh == dstCh) return pcm;      // 格式一致直接透传
+
+#if CF_HAVE_FFMPEG
+    AVChannelLayout inL, outL;
+    av_channel_layout_default(&inL, srcCh);
+    av_channel_layout_default(&outL, dstCh);
+
+    struct SwrContext *swr = NULL;
+    if (swr_alloc_set_opts2(&swr, &outL, AV_SAMPLE_FMT_S16, dstRate,
+                            &inL, AV_SAMPLE_FMT_S16, srcRate, 0, NULL) < 0 || !swr) {
+        return nil;
+    }
+    if (swr_init(swr) < 0) { swr_free(&swr); return nil; }
+
+    NSMutableData *out = [NSMutableData dataWithLength:want];
+    const uint8_t *inp[1] = { (const uint8_t *)pcm.bytes };
+    uint8_t *outp[1] = { (uint8_t *)out.mutableBytes };
+    int outSamples = (int)(want / (2 * (NSUInteger)dstCh));
+    int got = swr_convert(swr, outp, outSamples, inp, (int)(pcm.length / (2 * (NSUInteger)srcCh)));
+    swr_free(&swr);
+    if (got <= 0) return nil;
+    out.length = (NSUInteger)got * 2 * (NSUInteger)dstCh;
+    return out;
+#else
+    return nil;                                                // 无 FFmpeg 时不做重采样
+#endif
+}
+
 - (CMSampleBufferRef)nextAudioSampleBufferMatching:(CMSampleBufferRef)original {
     if (!original) return NULL;
     if (!self.audioReplaceEnabled) {
@@ -384,14 +421,47 @@ static BOOL cf_block_is_silent(CMBlockBufferRef block, size_t totalBytes) {
     char *data = NULL;
     size_t lengthAtOffset = 0, totalLengthOut = 0;
     if (CMBlockBufferGetDataPointer(block, 0, &lengthAtOffset, &totalLengthOut, &data) == noErr && data) {
-        static double phase = 0;
-        double dphase = 2.0 * M_PI * 440.0 / asbd->mSampleRate;
-        for (CMItemCount i = 0; i < numSamples; i++) {
-            int16_t v = (int16_t)(sin(phase) * 0.3 * 32767.0);
-            phase += dphase;
-            if (phase > 2.0 * M_PI) phase -= 2.0 * M_PI;
-            for (UInt32 ch = 0; ch < asbd->mChannelsPerFrame; ch++) {
-                memcpy(data + ((size_t)i * asbd->mChannelsPerFrame + ch) * 2, &v, 2);
+        BOOL filled = NO;
+
+        // 1) 优先用「直连」推过来的 PCM（PC 推什么就播什么）
+        if ([self.source isKindOfClass:[CFDirectSource class]]) {
+            CFDirectSource *ds = (CFDirectSource *)self.source;
+            if (ds.hasAudio) {
+                NSUInteger srcRate = [CFDirectSource audioSampleRate];
+                NSUInteger srcCh   = [CFDirectSource audioChannels];
+                NSUInteger dstBytesPerFrame = (asbd->mBytesPerFrame ?: (2 * asbd->mChannelsPerFrame));
+                NSUInteger dstSamples = totalBytes / (dstBytesPerFrame ?: 1);
+                NSUInteger srcFrames  = (NSUInteger)((double)dstSamples * srcRate /
+                                                     MAX(asbd->mSampleRate, 1.0));
+                NSData *pcm = [ds takeAudioBytes:srcFrames * srcCh * 2];
+                if (pcm.length) {
+                    NSData *conv = [self convertPCM:pcm
+                                           fromRate:(int)srcRate fromCh:(int)srcCh
+                                             toRate:(int)asbd->mSampleRate
+                                               toCh:(int)asbd->mChannelsPerFrame
+                                          wantBytes:totalBytes];
+                    if (conv.length) {
+                        size_t n = MIN(conv.length, totalBytes);
+                        memcpy(data, conv.bytes, n);
+                        if (n < totalBytes) memset(data + n, 0, totalBytes - n);   // 尾部补静音
+                        filled = YES;
+                        [CFLogger.shared incDirectAudio];
+                    }
+                }
+            }
+        }
+
+        // 2) 没有推流音频 → 440Hz 标记音（研究用：听感上一秒分辨注入是否生效）
+        if (!filled) {
+            static double phase = 0;
+            double dphase = 2.0 * M_PI * 440.0 / asbd->mSampleRate;
+            for (CMItemCount i = 0; i < numSamples; i++) {
+                int16_t v = (int16_t)(sin(phase) * 0.3 * 32767.0);
+                phase += dphase;
+                if (phase > 2.0 * M_PI) phase -= 2.0 * M_PI;
+                for (UInt32 ch = 0; ch < asbd->mChannelsPerFrame; ch++) {
+                    memcpy(data + ((size_t)i * asbd->mChannelsPerFrame + ch) * 2, &v, 2);
+                }
             }
         }
     }
