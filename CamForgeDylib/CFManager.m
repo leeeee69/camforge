@@ -123,7 +123,7 @@
         };
         CMSampleBufferRef sb = NULL;
         OSStatus st = CMSampleBufferCreateReadyWithImageBuffer(
-            kCFAllocatorDefault, nv12, true, NULL, NULL,
+            kCFAllocatorDefault, nv12,
             self.converter.formatDescription, &timing, &sb);
         CVPixelBufferRelease(nv12);
         if (st == noErr && sb) {
@@ -164,10 +164,11 @@
     if (st != noErr || !block) { CFRetain(original); return original; }
 
     // 440Hz 正弦标记音（研究用：听感上立刻能分辨注入是否生效）
-    // 注意：CMBlockBufferGetDataPointer 返回 OSStatus，数据指针是出参
+    // 注意：CMBlockBufferGetDataPointer(theBuffer, offset, lengthAtOffsetOut, totalLengthOut, dataPointerOut)
+    // offset 是值；totalLengthOut 在 dataPointerOut 之前
     char *data = NULL;
     size_t lengthAtOffset = 0, totalLengthOut = 0;
-    if (CMBlockBufferGetDataPointer(block, 0, &lengthAtOffset, &data, &totalLengthOut) == noErr && data) {
+    if (CMBlockBufferGetDataPointer(block, 0, &lengthAtOffset, &totalLengthOut, &data) == noErr && data) {
         static double phase = 0;
         double dphase = 2.0 * M_PI * 440.0 / asbd->mSampleRate;
         for (CMItemCount i = 0; i < numSamples; i++) {
