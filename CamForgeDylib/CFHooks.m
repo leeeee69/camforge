@@ -93,6 +93,7 @@ static void cf_load() {
             return;   // 非目标进程：不 hook、不建窗，dylib 完全 inert
         }
         [CFLogger.shared log:@"loaded into %@, installing hooks", bid];
+        [CFLogger.shared log:@"log file: %@", [CFLogger.shared logFilePath]];
         dispatch_async(dispatch_get_main_queue(), ^{
             cf_install();
             [[CFMenu shared] buildIfNeeded];

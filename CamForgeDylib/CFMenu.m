@@ -161,6 +161,7 @@ typedef NS_ENUM(NSInteger, CFUiMode) {
 
 @property (nonatomic, assign) CFUiMode uiMode;
 @property (nonatomic, assign) NSInteger buildRetries;
+@property (nonatomic, copy, nullable) NSString *sheetBody;
 
 - (void)setTile:(CFTileTag)tag title:(NSString *)title on:(BOOL)on;
 - (NSString *)symbolForTag:(CFTileTag)tag;
@@ -658,6 +659,18 @@ typedef NS_ENUM(NSInteger, CFUiMode) {
     x.frame = CGRectMake(kPanelW - kPad - 26, 12, 26, 26);
     [s addSubview:x];
 
+    UIButton *copy = [UIButton buttonWithType:UIButtonTypeCustom];
+    copy.frame = CGRectMake(kPanelW - kPad - 26 - 34, 12, 30, 26);
+    [copy setImage:[UIImage systemImageNamed:@"doc.on.doc"
+                          withConfiguration:[UIImageSymbolConfiguration configurationWithPointSize:13
+                                                                                            weight:UIImageSymbolWeightSemibold]]
+          forState:UIControlStateNormal];
+    copy.tintColor = CFSub();
+    copy.backgroundColor = CFTileBG();
+    copy.layer.cornerRadius = 13;
+    [copy addTarget:self action:@selector(onCopySheetBody) forControlEvents:UIControlEventTouchUpInside];
+    [s addSubview:copy];
+
     UITextView *tv = [[UITextView alloc] initWithFrame:CGRectMake(kPad, 42, kPanelW - kPad * 2, kPanelH - 42 - kPad)];
     tv.backgroundColor = UIColor.clearColor;
     tv.editable = NO;
@@ -669,6 +682,13 @@ typedef NS_ENUM(NSInteger, CFUiMode) {
 
     [self.panel addSubview:s];
     self.sheet = s;
+    self.sheetBody = body;
+}
+
+- (void)onCopySheetBody {
+    if (self.sheetBody.length == 0) return;
+    UIPasteboard.generalPasteboard.string = self.sheetBody;
+    [CFLogger.shared log:@"日志已复制到剪贴板（%lu 字节）", (unsigned long)self.sheetBody.length];
 }
 
 - (void)onDismissSheet {
@@ -677,7 +697,9 @@ typedef NS_ENUM(NSInteger, CFUiMode) {
 }
 
 - (void)onDiagnostics {
-    [self showSheetTitle:@"诊断信息" body:[CFLogger.shared statsText]];
+    // 带日志文件路径 + 最近 120 行：崩过之后也能看到崩前发生了什么
+    [self showSheetTitle:@"诊断信息（可复制）"
+                    body:[CFLogger.shared exportTextWithLines:120]];
 }
 
 - (void)onAiScript {
@@ -709,7 +731,7 @@ typedef NS_ENUM(NSInteger, CFUiMode) {
     NSString *body =
         [NSString stringWithFormat:
          @"CamForge 研究版\n"
-         @"版本    : 0.3.0 (2026-10-18)\n"
+         @"版本    : 0.6.0 (2026-10-18)\n"
          @"宿主    : %@\n"
          @"架构    : arm64 + arm64e（fat）\n"
          @"签名    : ldid\n"
