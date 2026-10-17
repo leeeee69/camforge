@@ -4,6 +4,18 @@
 set -e
 cd "$(dirname "$0")"
 
+# ---------------------------------------------------------------------------
+# FFmpeg（可选）：有 xcrun 的 macOS 环境（CI 的 macos-14 runner）自动交叉编译。
+# 越狱设备上没有 xcrun，跳过 —— Makefile 检测不到 vendor/ffmpeg/lib 就自动降级，
+# RTSP/RTMP/FLV 那几路标记为不可用，其余功能不受影响。
+# 设 CF_SKIP_FFMPEG=1 可强制跳过（本地快速验证内存相关改动时用）。
+# ---------------------------------------------------------------------------
+if [ "${CF_SKIP_FFMPEG:-0}" != "1" ] && command -v xcrun >/dev/null 2>&1 \
+   && [ ! -f vendor/ffmpeg/lib/libavformat.a ]; then
+    echo "==> building FFmpeg (static, arm64 + arm64e)"
+    ./vendor/build-ffmpeg.sh || echo "!! FFmpeg 编译失败，继续构建无 FFmpeg 版本"
+fi
+
 echo "==> building"
 make clean >/dev/null 2>&1 || true
 make
