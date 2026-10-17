@@ -1,6 +1,15 @@
 //
 //  CFManager.m — 渲染调度中枢
 //
+//  渲染线程：com.camforge.render（串行队列 + dispatch_source 30fps 节拍）
+//  数据流：source(BGRA) → converter(目标格式) → CMSampleBuffer → jitter → proxy 取走
+//
+//  2026-10-18 加固：
+//   - format description 为 NULL 时不再硬塞给 CMSampleBufferCreateReadyWithImageBuffer
+//   - 取帧前抓一份 strong 源引用，避免切源瞬间被换掉
+//   - 逐帧异常兜底，出错只记 lastError，不让整个进程崩
+//   - 新增：旋转 / 镜像 / 填充适应 / 画面去重 / 音频去重 / 期望像素格式跟随
+//
 
 #import "CFManager.h"
 #import "CFPixelConverter.h"
@@ -11,10 +20,50 @@
 #import "CFAssetSource.h"
 #import "CFMenu.h"
 #import <math.h>
+#import <string.h>
+
+/// 内容摘要（FNV-1a，抽样扫描；用于画面去重）
+static uint64_t cf_digest(CVPixelBufferRef pb) {
+    if (!pb) return 0;
+    CVPixelBufferLockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+    uint64_t h = 1469598103934665603ULL;
+    void *base = CVPixelBufferIsPlanar(pb) ? CVPixelBufferGetBaseAddressOfPlane(pb, 0)
+                                           : CVPixelBufferGetBaseAddress(pb);
+    size_t len = CVPixelBufferIsPlanar(pb) ? CVPixelBufferGetBytesPerRowOfPlane(pb, 0)
+                                           : CVPixelBufferGetDataSize(pb);
+    if (base && len > 0) {
+        size_t step = len / 256 ? len / 256 : 1;
+        const uint8_t *p = (const uint8_t *)base;
+        for (size_t i = 0; i < len; i += step) {
+            h ^= p[i];
+            h *= 1099511628211ULL;
+        }
+    }
+    CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+    return h;
+}
+
+/// 原音频是否静音（抽样判定；用于"音频去重"：静音段不注入，避免连成一片嗡声）
+static BOOL cf_block_is_silent(CMBlockBufferRef block, size_t totalBytes) {
+    if (!block || totalBytes == 0) return YES;
+    char *data = NULL;
+    size_t lenAt = 0, total = 0;
+    if (CMBlockBufferGetDataPointer(block, 0, &lenAt, &total, &data) != noErr || !data) return NO;
+    size_t n = total < totalBytes ? total : totalBytes;
+    size_t step = n / 128 ? n / 128 : 1;
+    for (size_t i = 0; i + 1 < n; i += step * 2) {
+        int16_t v = 0;
+        memcpy(&v, data + i, 2);
+        if (v > 64 || v < -64) return NO;
+    }
+    return YES;
+}
 
 @interface CFManager ()
 @property (nonatomic, assign) CMTime lastPTS;                        ///< 递增 PTS（30fps）
+@property (nonatomic, assign) uint64_t lastVideoDigest;              ///< 画面去重摘要
 @property (nonatomic, strong, nullable) dispatch_source_t renderTimer; ///< 渲染节拍器
+- (void)applySourceType:(CFSourceType)type urlOrPath:(nullable NSString *)s;
 @end
 
 @implementation CFManager
@@ -34,7 +83,15 @@
         _replacing  = NO;
         _audioReplaceEnabled = NO;
         _source     = [CFSyntheticSource new];   // 默认合成图案，零外部依赖
+        _sourceType = CFSourceTypeSynthetic;
         _lastPTS    = kCMTimeZero;
+        _targetPixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
+        _rotationDegrees = 0;
+        _mirrored = NO;
+        _fillMode = YES;
+        _frameDedupe = NO;
+        _audioDedupe = NO;
+        _panelAlpha = 1.0;
     }
     return self;
 }
@@ -43,20 +100,40 @@
 
 - (void)startReplacing {
     if (self.replacing) return;
+    if (self.sourceType == CFSourceTypeDirect) {
+        self.lastError = @"直连模式不注入，切到「视频」或「网络」再开始";
+        [CFLogger.shared log:@"startReplacing 被拒绝：当前为直连模式"];
+        return;
+    }
     self.replacing = YES;
+    self.lastError = nil;
+    [self syncRenderOptions];
     if ([self.source respondsToSelector:@selector(prepare)]) {
         [self.source prepare];
     }
-    dispatch_queue_t q = dispatch_queue_create("com.camforge.render", DISPATCH_QUEUE_SERIAL);
+
+    if (_renderTimer) {
+        dispatch_source_cancel(_renderTimer);
+        _renderTimer = nil;
+    }
+    static dispatch_queue_t q;
+    static dispatch_once_t onceQ;
+    dispatch_once(&onceQ, ^{
+        q = dispatch_queue_create("com.camforge.render", DISPATCH_QUEUE_SERIAL);
+    });
     _renderTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, q);
     // 30fps 渲染节拍；lead=1ms 防累积漂移
     dispatch_source_set_timer(_renderTimer, DISPATCH_TIME_NOW,
                               (uint64_t)(1.0 / 30.0 * NSEC_PER_SEC), 1 * NSEC_PER_MSEC);
     __weak typeof(self) weakSelf = self;
     dispatch_source_set_event_handler(_renderTimer, ^{
-        [weakSelf renderOneFrame];
+        @autoreleasepool {
+            [weakSelf renderOneFrame];
+        }
     });
     dispatch_resume(_renderTimer);
+    [CFLogger.shared log:@"开始替换（源: %@，旋转 %ld，镜像 %d，填充 %d）",
+        self.source.sourceName, (long)self.rotationDegrees, self.mirrored, self.fillMode];
 }
 
 - (void)stopReplacing {
@@ -70,31 +147,81 @@
         [self.source teardown];
     }
     [self.jitter drain];
+    [CFLogger.shared log:@"停止替换（已恢复真实相机）"];
+}
+
+#pragma mark - 选项
+
+- (void)syncRenderOptions {
+    self.converter.targetPixelFormat = self.targetPixelFormat;
+    self.converter.rotationDegrees = self.rotationDegrees;
+    self.converter.mirrored = self.mirrored;
+    self.converter.fillMode = self.fillMode;
+}
+
+- (void)noteVideoOutputSettings:(NSDictionary *)settings {
+    if (![settings isKindOfClass:[NSDictionary class]]) return;
+    id v = settings[(id)kCVPixelBufferPixelFormatTypeKey];
+    OSType fmt = 0;
+    if ([v isKindOfClass:[NSNumber class]]) fmt = (OSType)[v unsignedIntValue];
+    if (fmt == 0) {
+        // videoSettings 为空时 AVFoundation 默认给 420v
+        fmt = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
+    }
+    // 只支持这三种；其他格式一律退回 420v（CoreImage 能渲染的就这些）
+    if (fmt != kCVPixelFormatType_32BGRA &&
+        fmt != kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange &&
+        fmt != kCVPixelFormatType_420YpCbCr8BiPlanarFullRange) {
+        [CFLogger.shared log:@"videoSettings 格式 0x%x 不支持，回退 420v", fmt];
+        fmt = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
+    }
+    if (self.targetPixelFormat != fmt) {
+        self.targetPixelFormat = fmt;
+        [self syncRenderOptions];
+        [CFLogger.shared log:@"跟随目标 output 像素格式: 0x%x", fmt];
+    }
 }
 
 #pragma mark - 源切换
 
 - (void)switchToSourceType:(CFSourceType)type urlOrPath:(NSString *)s {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        if ([self.source respondsToSelector:@selector(teardown)]) {
-            [self.source teardown];
-        }
-        switch (type) {
-            case CFSourceTypeVideoFile:
-                self.source = [[CFAssetSource alloc] initWithURL:[NSURL fileURLWithPath:s]];
-                break;
-            case CFSourceTypeNetwork:
-                self.source = [[CFAssetSource alloc] initWithURL:[NSURL URLWithString:s]];
-                break;
-            default:
-                self.source = [CFSyntheticSource new];
-                break;
-        }
-        if (self.replacing && [self.source respondsToSelector:@selector(prepare)]) {
-            [self.source prepare];
-        }
-        [self.menu refresh];
-    });
+    // 已经在主线程就同步执行：否则「切源 → 立刻开始替换」会先拿旧源出几帧
+    if ([NSThread isMainThread]) {
+        [self applySourceType:type urlOrPath:s];
+    } else {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self applySourceType:type urlOrPath:s];
+        });
+    }
+}
+
+- (void)applySourceType:(CFSourceType)type urlOrPath:(NSString *)s {
+    self.sourceType = type;
+    if ([self.source respondsToSelector:@selector(teardown)]) {
+        [self.source teardown];
+    }
+    switch (type) {
+        case CFSourceTypeVideoFile:
+            self.source = [[CFAssetSource alloc] initWithURL:[NSURL fileURLWithPath:s ?: @""]];
+            break;
+        case CFSourceTypeNetwork:
+            self.source = [[CFAssetSource alloc] initWithURL:[NSURL URLWithString:s ?: @""]];
+            break;
+        case CFSourceTypeDirect:
+            // 直连 = 相机原样透传，不注入
+            [self stopReplacing];
+            self.source = [CFSyntheticSource new];
+            break;
+        default:
+            self.source = [CFSyntheticSource new];
+            self.sourceType = CFSourceTypeSynthetic;
+            break;
+    }
+    if (self.replacing && [self.source respondsToSelector:@selector(prepare)]) {
+        [self.source prepare];
+    }
+    [self.menu refresh];
+    [CFLogger.shared log:@"切换源: %@", self.source.sourceName];
 }
 
 - (CFMenu *)menu {
@@ -105,14 +232,37 @@
 
 - (void)renderOneFrame {
     @autoreleasepool {
-        // 1) 源出帧（BGRA，+1）
-        CVPixelBufferRef bgra = [self.source nextPixelBuffer];
+        if (!self.replacing) return;
+
+        // 1) 源出帧（BGRA，+1）。先抓一份 strong 引用，防切源瞬间被释放
+        id<CFFrameSource> src = self.source;
+        CVPixelBufferRef bgra = [src nextPixelBuffer];
         if (!bgra) return;
 
-        // 2) 转 NV12（相机链最常见格式，+1）
-        CVPixelBufferRef nv12 = [self.converter convertBGRA:bgra];
+        // 画面去重：内容没变就不重复注入
+        if (self.frameDedupe) {
+            uint64_t d = cf_digest(bgra);
+            if (d == self.lastVideoDigest) {
+                CVPixelBufferRelease(bgra);
+                return;
+            }
+            self.lastVideoDigest = d;
+        }
+
+        // 2) 转目标像素格式（+1）
+        CVPixelBufferRef out = [self.converter convertBGRA:bgra];
         CVPixelBufferRelease(bgra);
-        if (!nv12) return;
+        if (!out) {
+            self.lastError = @"像素转换失败（尺寸或格式不支持）";
+            return;
+        }
+
+        CMVideoFormatDescriptionRef fd = [self.converter formatDescription];
+        if (!fd) {
+            self.lastError = @"format description 创建失败";
+            CVPixelBufferRelease(out);
+            return;
+        }
 
         // 3) 打包 SampleBuffer，PTS 按 30fps 递增
         self.lastPTS = CMTimeAdd(self.lastPTS, CMTimeMake(1, 30));
@@ -123,20 +273,23 @@
         };
         CMSampleBufferRef sb = NULL;
         OSStatus st = CMSampleBufferCreateReadyWithImageBuffer(
-            kCFAllocatorDefault, nv12,
-            self.converter.formatDescription, &timing, &sb);
-        CVPixelBufferRelease(nv12);
-        if (st == noErr && sb) {
-            [self.jitter pushSampleBuffer:sb];
-            CFRelease(sb);
-            [CFLogger.shared incRendered];
+            kCFAllocatorDefault, out, fd, &timing, &sb);
+        CVPixelBufferRelease(out);
+        if (st != noErr || !sb) {
+            self.lastError = [NSString stringWithFormat:@"CMSampleBuffer 创建失败 (%d)", (int)st];
+            return;
         }
+        [self.jitter pushSampleBuffer:sb];
+        CFRelease(sb);
+        self.outputSize = self.converter.outputSize;
+        [CFLogger.shared incRendered];
     }
 }
 
 #pragma mark - 供 proxy 调用
 
 - (CMSampleBufferRef)nextVideoSampleBuffer {
+    if (!self.replacing) return NULL;
     return (CMSampleBufferRef)[self.jitter popRetained];   // +1 或 NULL
 }
 
@@ -148,14 +301,31 @@
     }
 
     CMFormatDescriptionRef fmt = CMSampleBufferGetFormatDescription(original);
+    if (!fmt) { CFRetain(original); return original; }
     const AudioStreamBasicDescription *asbd =
         CMAudioFormatDescriptionGetStreamBasicDescription(fmt);
-    if (!asbd) { CFRetain(original); return original; }
+    if (!asbd || asbd->mSampleRate <= 0 || asbd->mChannelsPerFrame == 0) {
+        CFRetain(original);
+        return original;
+    }
 
     CMItemCount numSamples = CMSampleBufferGetNumSamples(original);
+    if (numSamples <= 0) { CFRetain(original); return original; }
+
     size_t frameBytes = asbd->mBytesPerFrame ? asbd->mBytesPerFrame
                                              : 2 * asbd->mChannelsPerFrame;
     size_t totalBytes = (size_t)numSamples * frameBytes;
+    if (totalBytes == 0) { CFRetain(original); return original; }
+
+    // 音频去重：原帧是静音段就不注入 —— 否则标记音会在一整段静音上连成嗡声，
+    // 既没信息量又容易听出异常。判定走抽样，几乎零开销。
+    if (self.audioDedupe) {
+        CMBlockBufferRef srcBlock = CMSampleBufferGetDataBuffer(original);
+        if (cf_block_is_silent(srcBlock, totalBytes)) {
+            CFRetain(original);
+            return original;
+        }
+    }
 
     CMBlockBufferRef block = NULL;
     OSStatus st = CMBlockBufferCreateWithMemoryBlock(
@@ -192,15 +362,16 @@
     st = CMSampleBufferCreate(kCFAllocatorDefault, block, true, NULL, NULL,
                               fmt, numSamples, 1, &timing, 0, NULL, &sb);
     CFRelease(block);
-    if (st != noErr) { CFRetain(original); return original; }
+    if (st != noErr || !sb) { CFRetain(original); return original; }
     return sb;   // +1
 }
 
 #pragma mark - 补挂 hook
 
 - (void)rescanSessionOutputs:(AVCaptureSession *)session {
+    if (!session) return;
     [CFLogger.shared incSession];
-    [CFLogger.shared log:@"session startRunning，补扫 outputs: %@", session.outputs];
+    [CFLogger.shared log:@"session startRunning，补扫 outputs: %lu", (unsigned long)session.outputs.count];
     for (AVCaptureOutput *o in session.outputs) {
         if ([o isKindOfClass:[AVCaptureVideoDataOutput class]]) {
             [CFCaptureProxy wrapVideoOutput:(AVCaptureVideoDataOutput *)o];
