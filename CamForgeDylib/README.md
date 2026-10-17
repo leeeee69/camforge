@@ -15,11 +15,52 @@
 
 - Hook `AVCaptureVideoDataOutput/AVCaptureAudioDataOutput` 的 `setSampleBufferDelegate:queue:`
 - Hook `AVCaptureSession startRunning` 做补扫
-- 委托代理换帧（`CFCaptureProxy`），帧经 `CFPixelConverter`（BGRA→NV12）→ `CFJitterBuffer` 抖动缓冲 → `CMSampleBuffer` 回填
-- 三种视频源：合成图案 / 本地视频（AVAssetReader）/ 网络流（同一入口，URL 传入即可）
+- 委托代理换帧（`CFCaptureProxy`），帧经 `CFPixelConverter`（BGRA→目标格式）→ `CFJitterBuffer` 抖动缓冲 → `CMSampleBuffer` 回填
+- 帧源三种 + 直连对照：合成图案 / 本地视频（AVAssetReader）/ 网络流（HLS·mp4）/ 直连透传
+- 画面变换：旋转（0/90/180/270）、水平镜像、填充/适应
 - 440Hz 正弦标记音（`CFManager` 的 audio 分支），用于肉眼/仪器确认注入
-- 悬浮面板 `CFMenu`：切换源 / 开关音频 / 诊断 / 隐藏 / 拖拽
+- 悬浮面板 `CFMenu`：直播模式分段 / 拉流地址 / 粘贴-加载-停止 / 8 格功能矩阵 / 离线话术 / 诊断
 - 诊断埋点 `CFLogger`：计数器 + 事件流水，实验判读全靠它
+
+## 1.1 面板功能对照（v0.3.0）
+
+面板层级对齐参考实现的 UI：标题栏 → 提示 → 直播模式 → 拉流地址 → 操作行 → 功能矩阵 → 底部两项。
+
+| 控件 | 实际行为（都是本地实现，零联网） |
+|---|---|
+| 视频 / 网络 / 直连 | 本地视频文件 / http(s)·HLS·mp4 / 相机原样透传（A/B 对照） |
+| 📋 粘贴 | 读系统剪贴板填进地址栏 |
+| ⬇ 加载 | 校验地址 → 切源 → 开始注入 |
+| ⏹ 停止 | 停注入，恢复真实相机 |
+| 应用替屏 | 等价「加载 + 开始」，注入中则变成停止 |
+| 旋转 | 0°→90°→180°→270° 顺时针，走 CIImage 变换 |
+| 画面镜像 | 水平翻转 |
+| 内容 | 填充（裁切铺满）/ 适应（留黑边） |
+| 透明 | 面板自身透明度 100/80/60/40% |
+| 画面去重 | 逐帧内容摘要（FNV 抽样），相同则不重复注入 |
+| 音频去重 | 原音频为静音段时不注入，避免标记音连成嗡声 |
+| 音频注入 | 440Hz 标记音开关（默认关） |
+| AI 话术 | 内置 8 条离线话术轮播，**不联网、不调模型** |
+| 更新&反馈 | 版本/架构/宿主信息，纯本地弹层 |
+| ⓘ / 状态行 | 诊断信息（计数 + 最近 12 条事件） |
+| ✕ | 收起成右下角「CF」小气泡，点气泡再展开；标题栏可拖拽 |
+
+> 说明：参考实现里的「AI 话术」是真接了模型/接口的；本工程刻意不联网，所以这里是**离线内置话术轮播**，功能形态一致但不含任何网络调用。
+
+## 1.2 为什么产物只有几百 K（原版 6.3 MB）
+
+不是功能缺失导致的体积差异，主要是这几块原版有、自研版刻意没有的东西：
+
+| 原版占体积的部分 | 本工程 |
+|---|---|
+| 内置 FFmpeg + NEON 汇编（解 RTSP/RTP/HTTP-FLV） | ❌ 未链，约 3–4 MB 就省在这里；用 AVFoundation 只支持 http(s)/HLS/mp4 |
+| 图标/公告图/字体等资源包 | ❌ 界面用 SF Symbols，无位图资源 |
+| 卡密授权、反调试、反篡改双签、隐形水印、语音克隆客户端 | ❌ 全部不 port |
+| 五路源 + USB 直通等分支代码 | ⚠️ 只保留三路 + 直连 |
+| 调试符号 | ✅ 两个架构的 dSYM 都不进交付物（CI 里只上传 dylib+plist） |
+
+现在交付的 dylib 是 **566 KB**（arm64 + arm64e 两个切片）。真需要 RTSP，唯一办法是把 FFmpeg 链进来，体积会直接回到 4–5 MB 量级——那是另一个工程量，不是改几行代码。
+
 
 ## 2. 与 tweak 版（CamForge/）的差异
 
@@ -136,9 +177,16 @@ cp libCamForge.plist /Library/MobileSubstrate/DynamicLibraries/   # 文件名必
 killall -9 SpringBoard      # 或 killall -9 Aweme 让抖音重启后加载
 ```
 
-- 只注入抖音，其他进程即使扫到该目录也不会加载（filter plist + 构造器双兜底）。
+- 默认注入 **抖音 + 微信** 两个宿主；其他进程即使扫到该目录也不会加载（filter plist + 构造器双兜底）。
+- **加宿主要改两处**：`libCamForge.plist` 的 `Filter/Bundles` 和 `CFHooks.m` 的 `cf_targetBundleIDs()`。只改 plist 会出现「dylib 加载了但没面板」——因为构造器 guard 先 return 了。
 - 卸载：删这两个文件 + 重启 SpringBoard。
 - **sileo/依赖**：无需装任何依赖 deb，dylib 直接生效（这就是独立 dylib 相对 tweak deb 的优势）。
+
+### A2. 微信里没有面板？（v0.3.0 已修）
+
+旧版 plist 只写了 `com.ss.iphone.ugc.Aweme`，所以微信进程根本不会加载 dylib。现在两个都列上了，重启微信即可看到面板。
+
+边界提醒：微信里这个面板只用于**预览对照**，不要用在视频通话/直播/外发场景（见第 7 节）。
 
 ### B. insert_dylib 注入（非越狱/自签 IPA 路线）
 
@@ -174,6 +222,21 @@ DYLD_INSERT_LIBRARIES=/path/libCamForge.dylib /var/containers/Bundle/Application
 
 抖音版本迭代快，拍摄管线可能变更。若恒 0，先用 `videoHookHits` 数据 + `strings`/classdump 对比新版
 `Aweme` 的相机调用面，再决定 hook 点是否要跟着调——这是自研版最大的好处：一切可见、可改。
+
+## 6.1 已知崩溃点与修复（v0.3.0）
+
+上一版「一点开始替换就崩」是三处问题叠加，都已修：
+
+| # | 崩溃点 | 原因 | 修法 |
+|---|---|---|---|
+| 1 | 合成源画帧时崩 | `CFSyntheticSource` 在后台渲染队列调用 `-[NSString drawAtPoint:withAttributes:]`。这套 UIKit 文字绘制依赖线程局部的 UIGraphics 上下文，后台队列上没有 → 抛异常 | 改 **CoreText**（`CTLineDraw`）直接画进 CGContext，任意线程安全 |
+| 2 | 替换几帧后崩 | `CFPixelConverter` 的 format description 只在首次转换时创建，之后换分辨率/换格式都不重建；描述与 buffer 不匹配 | 按 `(尺寸, 像素格式)` 重建并判空；`formatDescription` 为 NULL 时不再调用 `CMSampleBufferCreateReadyWithImageBuffer` |
+| 3 | 退出相机/切前后台时崩 | App 用 `setSampleBufferDelegate:nil queue:nil` 清输出，hook 仍把代理塞回去（queue=nil）→ AVFoundation 抛 `NSInvalidArgumentException` | delegate 或 queue 为 nil 时一律跳过包装；代理对原 delegate 改 **strong** 持有 |
+| 4 | 下游解析崩 | 我们固定吐 NV12，而抖音/微信可能配的是 BGRA；App 按平面取 `GetBaseAddressOfPlane` 拿到 NULL | 读 `output.videoSettings` 跟随目标像素格式出帧（BGRA / 420v / 420f） |
+
+另外加了两层兜底：注入帧被下游拒时回退真帧再喂一次；`CFAssetSource` 不再 `CVPixelBufferRetain(NULL)`，并对连续读取失败次数设上限（避免 30fps 疯狂重建 reader）。
+
+排查手段：`idevicesyslog | grep CamForge`，面板 ⓘ 或点状态行也能看计数与最近事件。
 
 ## 7. 实验边界（再次明确）
 
