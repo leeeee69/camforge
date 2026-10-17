@@ -157,6 +157,7 @@ typedef NS_ENUM(NSInteger, CFUiMode) {
 @property (nonatomic, strong) UIView *sheet;
 
 @property (nonatomic, assign) CFUiMode uiMode;
+@property (nonatomic, assign) NSInteger buildRetries;
 
 - (void)setTile:(CFTileTag)tag title:(NSString *)title on:(BOOL)on;
 - (NSString *)symbolForTag:(CFTileTag)tag;
@@ -183,6 +184,18 @@ typedef NS_ENUM(NSInteger, CFUiMode) {
 
 #pragma mark - 建窗
 
+- (UIWindowScene *)activeScene {
+    if (@available(iOS 13.0, *)) {
+        for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
+            if ([s isKindOfClass:[UIWindowScene class]] &&
+                s.activationState == UISceneActivationStateForegroundActive) {
+                return (UIWindowScene *)s;
+            }
+        }
+    }
+    return nil;
+}
+
 - (UIWindow *)makeWindowWithFrame:(CGRect)frame level:(UIWindowLevel)level {
     UIWindow *w = [[UIWindow alloc] initWithFrame:frame];
     w.windowLevel = level;
@@ -190,19 +203,27 @@ typedef NS_ENUM(NSInteger, CFUiMode) {
     w.rootViewController = [UIViewController new];
     w.rootViewController.view.backgroundColor = UIColor.clearColor;
     if (@available(iOS 13.0, *)) {
-        for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
-            if ([s isKindOfClass:[UIWindowScene class]] &&
-                s.activationState == UISceneActivationStateForegroundActive) {
-                w.windowScene = (UIWindowScene *)s;
-                break;
-            }
-        }
+        w.windowScene = [self activeScene];
     }
     return w;
 }
 
 - (void)buildIfNeeded {
     if (self.window) { [self refresh]; return; }
+
+    // 构造器阶段 App 的场景可能还没激活，此时建的窗口挂不上去（表现为"没有面板"）。
+    // 这里退避重试，最多 20 次 × 0.5s。
+    if (![self activeScene]) {
+        if (self.buildRetries++ < 20) {
+            __weak typeof(self) weakSelf = self;
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                [weakSelf buildIfNeeded];
+            });
+        }
+        return;
+    }
+    self.buildRetries = 0;
 
     CGSize screen = UIScreen.mainScreen.bounds.size;
     CGFloat x = 12;
