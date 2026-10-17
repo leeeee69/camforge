@@ -1,0 +1,9 @@
+Package: com.camforge.research
+Name: CamForge
+Version: 1.0.0
+Architecture: iphoneos-arm64
+Description: Clean-room virtual camera research plugin (self-developed, no license module).
+Maintainer: Researcher <researcher@example.com>
+Author: Researcher
+Section: System
+Depends: firmware (>= 15.0), mobilesubstrate
