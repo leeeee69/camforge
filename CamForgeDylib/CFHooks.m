@@ -14,6 +14,7 @@
 #import "CFManager.h"
 #import "CFCaptureProxy.h"
 #import "CFLogger.h"
+#import "CFMenu.h"
 
 /// 目标进程 bundle id（抖音）。改这里即可换目标。
 static NSString *const kTargetBundleID = @"com.ss.iphone.ugc.Aweme";
