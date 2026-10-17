@@ -20,6 +20,7 @@
 #import "CFAssetSource.h"
 #import "CFAlbumSource.h"
 #import "CFExternalSource.h"
+#import "CFDirectSource.h"
 #import "CFMovieSource.h"
 #import "CFMenu.h"
 #import <math.h>
@@ -244,7 +245,8 @@ static BOOL cf_block_is_silent(CMBlockBufferRef block, size_t totalBytes) {
         }
 
         case CFSourceTypeUSB:
-            self.source = [CFExternalSource new];
+            // 直连 = PC 经 usbmuxd 推 JPEG 帧进来（与原版同一套传输通道）
+            self.source = [[CFDirectSource alloc] initWithPort:9527];
             self.sourceType = CFSourceTypeUSB;
             break;
 

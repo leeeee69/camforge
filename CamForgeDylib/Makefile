@@ -14,6 +14,7 @@ CamForge_FILES = \
     CFAssetSource.m \
     CFAlbumSource.m \
     CFExternalSource.m \
+    CFDirectSource.m \
     CFMovieSource.m \
     CFPixelConverter.m \
     CFJitterBuffer.m \

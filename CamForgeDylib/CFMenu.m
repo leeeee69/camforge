@@ -23,6 +23,7 @@
 #import "CFLogger.h"
 #import "CFMovieSource.h"
 #import "CFExternalSource.h"
+#import "CFDirectSource.h"
 #import <UIKit/UIKit.h>
 #import <QuartzCore/QuartzCore.h>
 #import <math.h>
@@ -511,14 +512,9 @@ typedef NS_ENUM(NSInteger, CFUiMode) {
     m.lastError = nil;
 
     if (self.uiMode == CFUiModeDirect) {
-        if (![CFExternalSource supported]) {
-            m.lastError = @"USB 直通需 iOS 17+ 且 USB-C 外接摄像头";
-            [self refresh];
-            return;
-        }
         [m switchToSourceType:CFSourceTypeUSB urlOrPath:nil];
         [m startReplacing];
-        if (!m.replacing) [self refresh];
+        [self refresh];
         return;
     }
 
@@ -761,9 +757,9 @@ typedef NS_ENUM(NSInteger, CFUiMode) {
             ? @"RTSP/RTMP/FLV 走 FFmpeg 软解；http(s)/HLS 走系统解码。"
             : @"本构建未含 FFmpeg：RTSP/RTMP/FLV 不可用，仅 http(s)/HLS。";
     } else if (self.uiMode == CFUiModeDirect) {
-        self.urlLabel.text = @"🔌  USB 外部摄像头直通";
-        self.field.placeholder = @"此模式不用地址（需 iOS 17+ 外接摄像头）";
-        self.hintLabel.text = @"用外部摄像头（USB-C UVC）出帧当源；无设备会提示。";
+        self.urlLabel.text = @"🔌  直连（USB 数据线 · usbmuxd 推送）";
+        self.field.placeholder = @"此模式不用地址：手机监听 127.0.0.1:9527";
+        self.hintLabel.text = @"PC 上 iproxy 9527 9527 后跑 tools/cf-push.py，帧实时推给手机。";
     } else {
         self.urlLabel.text = @"🎬  本地视频路径（留空 = 相册最新）";
         self.field.placeholder = @"/var/mobile/Media/test.mp4（可留空）";
