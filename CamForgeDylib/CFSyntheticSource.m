@@ -7,6 +7,8 @@
 
 #import "CFSyntheticSource.h"
 #import <CoreGraphics/CoreGraphics.h>
+#import <UIKit/UIKit.h>
+#import <math.h>
 
 @implementation CFSyntheticSource {
     CVPixelBufferPoolRef _pool;
