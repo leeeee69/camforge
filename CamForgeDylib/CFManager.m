@@ -12,6 +12,11 @@
 #import "CFMenu.h"
 #import <math.h>
 
+@interface CFManager ()
+@property (nonatomic, assign) CMTime lastPTS;                        ///< 递增 PTS（30fps）
+@property (nonatomic, strong, nullable) dispatch_source_t renderTimer; ///< 渲染节拍器
+@end
+
 @implementation CFManager
 
 + (instancetype)shared {
@@ -111,7 +116,7 @@
 
         // 3) 打包 SampleBuffer，PTS 按 30fps 递增
         self.lastPTS = CMTimeAdd(self.lastPTS, CMTimeMake(1, 30));
-        CMVideoTimingInfo timing = {
+        CMSampleTimingInfo timing = {
             .duration = CMTimeMake(1, 30),
             .presentationTimeStamp = self.lastPTS,
             .decodeTimeStamp = self.lastPTS,
@@ -159,8 +164,10 @@
     if (st != noErr || !block) { CFRetain(original); return original; }
 
     // 440Hz 正弦标记音（研究用：听感上立刻能分辨注入是否生效）
-    char *data = CMBlockBufferGetDataPointer(block, 0, NULL, NULL, NULL);
-    if (data) {
+    // 注意：CMBlockBufferGetDataPointer 返回 OSStatus，数据指针是出参
+    char *data = NULL;
+    size_t lengthAtOffset = 0, totalLengthOut = 0;
+    if (CMBlockBufferGetDataPointer(block, 0, &lengthAtOffset, &data, &totalLengthOut) == noErr && data) {
         static double phase = 0;
         double dphase = 2.0 * M_PI * 440.0 / asbd->mSampleRate;
         for (CMItemCount i = 0; i < numSamples; i++) {
