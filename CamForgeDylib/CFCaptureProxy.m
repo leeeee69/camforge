@@ -1,6 +1,14 @@
 //
 //  CFCaptureProxy.m
 //
+//  2026-10-18 崩溃修复：
+//   1) App 拆除时常用 setSampleBufferDelegate:nil queue:nil 清空输出。若此时仍把
+//      代理塞回去（queue=nil），AVFoundation 会抛 NSInvalidArgumentException 直接崩。
+//      → delegate 为空或 queue 为空时一律跳过包装。
+//   2) 顺手把 output.videoSettings 的像素格式同步给 CFManager，保证出帧格式一致；
+//      抖音/微信若配的是 BGRA，我们吐 NV12，它按平面取地址会拿 NULL 崩。
+//   3) 回调里对下游调用加异常兜底：注入帧被下游拒时回退真帧再试一次。
+//
 
 #import "CFCaptureProxy.h"
 #import "CFManager.h"
@@ -11,37 +19,56 @@
 @implementation CFCaptureProxy
 
 + (void)wrapVideoOutput:(AVCaptureVideoDataOutput *)output {
+    if (!output) return;
+
+    // 先同步目标像素格式（即便 delegate 已成代理，格式也可能被 App 重配）
+    [CFManager.shared noteVideoOutputSettings:output.videoSettings];
+
+    id current = output.sampleBufferDelegate;
+    if (!current) return;                               // 未设 / 刚被清空：等下一次 setter
+    if ([current isKindOfClass:[CFCaptureProxy class]]) return;
+
+    dispatch_queue_t q = output.sampleBufferCallbackQueue;
+    if (!q) {
+        [CFLogger.shared log:@"video output 无 callback queue，跳过包装（避免 nil queue 崩溃）"];
+        return;
+    }
+
     CFCaptureProxy *proxy = objc_getAssociatedObject(output, @selector(wrapVideoOutput:));
     if (!proxy) {
         proxy = [CFCaptureProxy new];
         objc_setAssociatedObject(output, @selector(wrapVideoOutput:), proxy,
                                  OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
-    id current = output.sampleBufferDelegate;
-    if (current != proxy) {
-        // 先记住 App 的真 delegate，再把代理塞进去
-        // （iOS 17 SDK 起 sampleBufferDelegate 为 readonly，必须走 setSampleBufferDelegate:queue:；
-        //   queue 沿用 App 原先那个，回调线程不变）
-        proxy.videoOriginal = current;
-        [output setSampleBufferDelegate:proxy queue:output.sampleBufferCallbackQueue];
-        // 会再次进入被 hook 的 setter，此时 delegate 已是 proxy，直接透传
-        [CFLogger.shared log:@"video delegate 已包装: %@ -> %@", current, output];
-    }
+    proxy.videoOriginal = current;                      // 先记住真 delegate，再换人
+    // iOS 17 SDK 起 sampleBufferDelegate 为 readonly，必须走 setter；
+    // queue 沿用 App 原先那个，回调线程不变。
+    [output setSampleBufferDelegate:proxy queue:q];
+    [CFLogger.shared log:@"video delegate 已包装: %@", NSStringFromClass([current class])];
 }
 
 + (void)wrapAudioOutput:(AVCaptureAudioDataOutput *)output {
+    if (!output) return;
+
+    id current = output.sampleBufferDelegate;
+    if (!current) return;
+    if ([current isKindOfClass:[CFCaptureProxy class]]) return;
+
+    dispatch_queue_t q = output.sampleBufferCallbackQueue;
+    if (!q) {
+        [CFLogger.shared log:@"audio output 无 callback queue，跳过包装"];
+        return;
+    }
+
     CFCaptureProxy *proxy = objc_getAssociatedObject(output, @selector(wrapAudioOutput:));
     if (!proxy) {
         proxy = [CFCaptureProxy new];
         objc_setAssociatedObject(output, @selector(wrapAudioOutput:), proxy,
                                  OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
-    id current = output.sampleBufferDelegate;
-    if (current != proxy) {
-        proxy.audioOriginal = current;
-        [output setSampleBufferDelegate:proxy queue:output.sampleBufferCallbackQueue];
-        [CFLogger.shared log:@"audio delegate 已包装: %@ -> %@", current, output];
-    }
+    proxy.audioOriginal = current;
+    [output setSampleBufferDelegate:proxy queue:q];
+    [CFLogger.shared log:@"audio delegate 已包装: %@", NSStringFromClass([current class])];
 }
 
 #pragma mark - 输出回调
@@ -49,23 +76,51 @@
 - (void)captureOutput:(AVCaptureOutput *)output
 didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
        fromConnection:(AVCaptureConnection *)connection {
-    BOOL isVideo = [output isKindOfClass:[AVCaptureVideoDataOutput class]];
-    id original = isVideo ? self.videoOriginal : self.audioOriginal;
-    if (![original respondsToSelector:@selector(captureOutput:didOutputSampleBuffer:fromConnection:)]) {
-        [CFLogger.shared log:@"%@: 无真 delegate，丢弃", isVideo ? @"video" : @"audio"];
-        return;
+    @autoreleasepool {
+        if (!sampleBuffer) return;
+
+        BOOL isVideo = [output isKindOfClass:[AVCaptureVideoDataOutput class]];
+        id original = isVideo ? self.videoOriginal : self.audioOriginal;
+        if (!original ||
+            ![original respondsToSelector:@selector(captureOutput:didOutputSampleBuffer:fromConnection:)]) {
+            [CFLogger.shared incPassthrough];
+            return;
+        }
+
+        if (isVideo) { [CFLogger.shared incVideoHookHit]; }
+        else         { [CFLogger.shared incAudioHookHit]; }
+
+        CMSampleBufferRef injected = NULL;
+        @try {
+            injected = isVideo
+                ? [CFManager.shared nextVideoSampleBuffer]
+                : [CFManager.shared nextAudioSampleBufferMatching:sampleBuffer];
+        } @catch (NSException *e) {
+            [CFLogger.shared log:@"取注入帧异常: %@", e.reason];
+            injected = NULL;
+        }
+
+        CMSampleBufferRef deliver = injected ? injected : sampleBuffer;
+        if (injected) { [CFLogger.shared incInjected]; }
+        else          { [CFLogger.shared incPassthrough]; }
+
+        __block BOOL ok = NO;
+        @try {
+            [original captureOutput:output didOutputSampleBuffer:deliver fromConnection:connection];
+            ok = YES;
+        } @catch (NSException *e) {
+            [CFLogger.shared log:@"下游处理注入帧异常: %@", e.reason];
+        }
+        // 注入帧被下游拒（格式/时长不合它意）时，回退真帧再喂一次，避免直接黑屏
+        if (!ok && injected) {
+            @try {
+                [original captureOutput:output didOutputSampleBuffer:sampleBuffer fromConnection:connection];
+            } @catch (NSException *e2) {
+                [CFLogger.shared log:@"回退真帧仍异常，本帧丢弃: %@", e2.reason];
+            }
+        }
+        if (injected) CFRelease(injected);
     }
-
-    if (isVideo) { [CFLogger.shared incVideoHookHit]; } else { [CFLogger.shared incAudioHookHit]; }
-
-    CMSampleBufferRef injected = isVideo
-        ? [CFManager.shared nextVideoSampleBuffer]
-        : [CFManager.shared nextAudioSampleBufferMatching:sampleBuffer];
-
-    CMSampleBufferRef deliver = injected ? injected : sampleBuffer;
-    if (injected) { [CFLogger.shared incInjected]; } else { [CFLogger.shared incPassthrough]; }
-    [original captureOutput:output didOutputSampleBuffer:deliver fromConnection:connection];
-    if (injected) CFRelease(injected);
 }
 
 @end
