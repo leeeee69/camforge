@@ -22,7 +22,7 @@ CamForge_FILES = \
     CFMenu.m
 
 CamForge_CFLAGS = -fobjc-arc
-CamForge_FRAMEWORKS = UIKit AVFoundation CoreMedia CoreVideo Accelerate QuartzCore CoreImage Foundation Photos
+CamForge_FRAMEWORKS = UIKit AVFoundation CoreMedia CoreVideo Accelerate QuartzCore CoreImage Foundation Photos PhotosUI
 CamForge_LDFLAGS = -lsubstrate
 
 # ── FFmpeg（可选）─────────────────────────────────────────────────────────────

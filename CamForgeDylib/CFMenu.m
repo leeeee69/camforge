@@ -26,6 +26,7 @@
 #import "CFDirectSource.h"
 #import <UIKit/UIKit.h>
 #import <QuartzCore/QuartzCore.h>
+#import <PhotosUI/PhotosUI.h>
 #import <math.h>
 
 static const CGFloat kPanelW  = 320;
@@ -143,7 +144,7 @@ typedef NS_ENUM(NSInteger, CFUiMode) {
     CFUiModeDirect,
 };
 
-@interface CFMenu () <UITextFieldDelegate>
+@interface CFMenu () <UITextFieldDelegate, PHPickerViewControllerDelegate>
 
 @property (nonatomic, strong) UIWindow *window;
 @property (nonatomic, strong) UIWindow *bubbleWindow;
@@ -165,6 +166,7 @@ typedef NS_ENUM(NSInteger, CFUiMode) {
 
 - (void)setTile:(CFTileTag)tag title:(NSString *)title on:(BOOL)on;
 - (NSString *)symbolForTag:(CFTileTag)tag;
+- (void)presentVideoPicker;
 
 @end
 
@@ -545,11 +547,9 @@ typedef NS_ENUM(NSInteger, CFUiMode) {
         return;
     }
 
-    // 视频模式：留空 = 相册最新一条；填了 = 本地文件
+    // 视频模式：留空 -> 弹系统相册选择器（实操里没人愿意手打沙盒路径）
     if (!s.length) {
-        [m switchToSourceType:CFSourceTypeAlbum urlOrPath:nil];
-        [m startReplacing];
-        [self refresh];
+        [self presentVideoPicker];
         return;
     }
     if (![s hasPrefix:@"/"]) {
@@ -560,6 +560,102 @@ typedef NS_ENUM(NSInteger, CFUiMode) {
     [m switchToSourceType:CFSourceTypeVideoFile urlOrPath:s];
     [m startReplacing];
     [self refresh];
+}
+
+#pragma mark - 相册选择（PHPicker，系统选择器，不改宿主 Info.plist、不需要权限描述）
+
+/// 找宿主 App 当前最顶层的 VC（模态要挂在这上面，挂我们的悬浮窗会显示异常）
+static UIViewController *cf_top_view_controller(void) {
+    UIWindow *key = nil;
+    if (@available(iOS 13.0, *)) {
+        for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) {
+            if (![sc isKindOfClass:[UIWindowScene class]]) continue;
+            if (sc.activationState != UISceneActivationStateForegroundActive) continue;
+            for (UIWindow *w in ((UIWindowScene *)sc).windows) {
+                if (w.isKeyWindow) { key = w; break; }
+            }
+            if (key) break;
+        }
+    }
+    if (!key) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        key = UIApplication.sharedApplication.keyWindow;
+#pragma clang diagnostic pop
+    }
+    UIViewController *vc = key.rootViewController;
+    while (vc.presentedViewController) vc = vc.presentedViewController;
+    return vc;
+}
+
+- (void)presentVideoPicker {
+    PHPickerConfiguration *cfg = [[PHPickerConfiguration alloc] init];
+    cfg.filter = PHPickerFilter.videosFilter;
+    cfg.selectionLimit = 1;
+    cfg.preferredAssetRepresentationMode = PHPickerConfigurationAssetRepresentationModeCurrent;
+
+    PHPickerViewController *picker = [[PHPickerViewController alloc] initWithConfiguration:cfg];
+    picker.delegate = self;
+
+    UIViewController *host = cf_top_view_controller();
+    if (!host) {
+        CFManager.shared.lastError = @"找不到可挂载的控制器，改用相册最新";
+        [CFManager.shared switchToSourceType:CFSourceTypeAlbum urlOrPath:nil];
+        [CFManager.shared startReplacing];
+        [self refresh];
+        return;
+    }
+    // 选片期间把面板藏起来，免得挡住选择器
+    self.window.hidden = YES;
+    [host presentViewController:picker animated:YES completion:nil];
+}
+
+- (void)picker:(PHPickerViewController *)picker didFinishPicking:(NSArray<PHPickerResult *> *)results {
+    [picker dismissViewControllerAnimated:YES completion:^{
+        self.window.hidden = NO;
+        [self refresh];
+    }];
+
+    if (results.count == 0) return;          // 用户取消
+
+    NSItemProvider *provider = results.firstObject.itemProvider;
+    NSString *type = @"public.movie";
+    if (![provider hasItemConformingToTypeIdentifier:type]) type = @"public.video";
+
+    __weak typeof(self) weakSelf = self;
+    [provider loadFileRepresentationForTypeIdentifier:type
+                                    completionHandler:^(NSURL *url, NSError *error) {
+        // 注意：这个 URL 在回调返回后就失效，必须立刻拷到自己的临时目录
+        NSError *copyErr = nil;
+        NSString *dst = nil;
+        if (url) {
+            NSString *ext = url.pathExtension.length ? url.pathExtension : @"mov";
+            dst = [NSTemporaryDirectory() stringByAppendingPathComponent:
+                   [NSString stringWithFormat:@"cf_pick.%@", ext]];
+            [[NSFileManager defaultManager] removeItemAtPath:dst error:NULL];
+            if (![[NSFileManager defaultManager] copyItemAtURL:url
+                                                         toURL:[NSURL fileURLWithPath:dst]
+                                                         error:&copyErr]) {
+                dst = nil;
+            }
+        }
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            typeof(self) self_ = weakSelf;
+            if (!self_) return;
+            if (!dst) {
+                CFManager.shared.lastError = copyErr.localizedDescription
+                    ?: @"选中的视频读不出来";
+                [self_ refresh];
+                return;
+            }
+            CFManager.shared.lastError = nil;
+            [CFManager.shared switchToSourceType:CFSourceTypeVideoFile urlOrPath:dst];
+            [CFManager.shared startReplacing];
+            [self_ refresh];
+            [CFLogger.shared log:@"相册选片: %@", dst];
+        });
+    }];
 }
 
 - (void)onStop {
@@ -783,9 +879,9 @@ typedef NS_ENUM(NSInteger, CFUiMode) {
         self.field.placeholder = @"此模式不用地址：手机监听 127.0.0.1:9527";
         self.hintLabel.text = @"PC 上 iproxy 9527 9527 后跑 tools/cf-push.py，帧实时推给手机。";
     } else {
-        self.urlLabel.text = @"🎬  本地视频路径（留空 = 相册最新）";
-        self.field.placeholder = @"/var/mobile/Media/test.mp4（可留空）";
-        self.hintLabel.text = @"填绝对路径读本地视频，留空则取相册最新一条，循环注入。";
+        self.urlLabel.text = @"🎬  本地视频（点「加载」从相册选）";
+        self.field.placeholder = @"留空即可：点「加载」弹出相册选视频";
+        self.hintLabel.text = @"点「加载」从相册挑一条视频，循环注入；也可在上面粘绝对路径。";
     }
 
     // 功能格
