@@ -6,6 +6,9 @@
 //  2. 构造器先查 bundle id，非目标进程直接 inert（防止 insert_dylib /
 //     DYLD_INSERT_LIBRARIES 方式下污染其他 App）
 //
+//  支持多个宿主（2026-10-18）：filter plist 里列出的每个 bundle 都会加载本 dylib，
+//  这里也必须放行同一份白名单，否则微信里 dylib 加载了却不建面板（表现为"微信没 UI"）。
+//
 
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
@@ -16,14 +19,27 @@
 #import "CFLogger.h"
 #import "CFMenu.h"
 
-/// 目标进程 bundle id（抖音）。改这里即可换目标。
-static NSString *const kTargetBundleID = @"com.ss.iphone.ugc.Aweme";
+/// 目标进程 bundle id 白名单。改这里 + libCamForge.plist 的 Filter/Bundles
+/// 两处要同步，否则会「加载了但不干活」。
+static NSArray<NSString *> *cf_targetBundleIDs(void) {
+    static NSArray<NSString *> *ids;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        ids = @[
+            @"com.ss.iphone.ugc.Aweme",   // 抖音
+            @"com.tencent.xin",           // 微信
+        ];
+    });
+    return ids;
+}
 
 #pragma mark - hook 实现（trampoline）
 
 static void (*g_origVideoSetDelegate)(id, SEL, id, dispatch_queue_t);
 static void hookVideoSetDelegate(id self, SEL _cmd, id delegate, dispatch_queue_t queue) {
     g_origVideoSetDelegate(self, _cmd, delegate, queue);
+    // delegate 为 nil 表示 App 正在拆输出：此时绝不能把代理塞回去（queue 也可能是 nil）
+    if (!delegate) return;
     if (![delegate isKindOfClass:[CFCaptureProxy class]]) {
         [CFCaptureProxy wrapVideoOutput:(AVCaptureVideoDataOutput *)self];
     }
@@ -32,6 +48,7 @@ static void hookVideoSetDelegate(id self, SEL _cmd, id delegate, dispatch_queue_
 static void (*g_origAudioSetDelegate)(id, SEL, id, dispatch_queue_t);
 static void hookAudioSetDelegate(id self, SEL _cmd, id delegate, dispatch_queue_t queue) {
     g_origAudioSetDelegate(self, _cmd, delegate, queue);
+    if (!delegate) return;
     if (![delegate isKindOfClass:[CFCaptureProxy class]]) {
         [CFCaptureProxy wrapAudioOutput:(AVCaptureAudioDataOutput *)self];
     }
@@ -40,10 +57,18 @@ static void hookAudioSetDelegate(id self, SEL _cmd, id delegate, dispatch_queue_
 static void (*g_origStartRunning)(id, SEL);
 static void hookStartRunning(id self, SEL _cmd) {
     g_origStartRunning(self, _cmd);
-    [[CFManager shared] rescanSessionOutputs:(AVCaptureSession *)self];
+    @try {
+        [[CFManager shared] rescanSessionOutputs:(AVCaptureSession *)self];
+    } @catch (NSException *e) {
+        [CFLogger.shared log:@"补扫 outputs 异常: %@", e.reason];
+    }
 }
 
 static void cf_install(void) {
+    static BOOL installed = NO;
+    if (installed) return;
+    installed = YES;
+
     // setSampleBufferDelegate:queue: — App 每次设 delegate 后把代理换进去
     MSHookMessageEx(objc_getClass("AVCaptureVideoDataOutput"),
                     @selector(setSampleBufferDelegate:queue:),
@@ -64,7 +89,7 @@ __attribute__((constructor))
 static void cf_load() {
     @autoreleasepool {
         NSString *bid = [NSBundle mainBundle].bundleIdentifier;
-        if (![bid isEqualToString:kTargetBundleID]) {
+        if (![cf_targetBundleIDs() containsObject:bid]) {
             return;   // 非目标进程：不 hook、不建窗，dylib 完全 inert
         }
         [CFLogger.shared log:@"loaded into %@, installing hooks", bid];
