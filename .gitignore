@@ -1,0 +1,13 @@
+# 绝不要 push 到公开仓库的内容：
+# - target.dylib 是原版付费二进制（侵权材料，传播即违法）
+# - macho_*.txt 是原版逆向证据（含二进制提取字符串）
+# - .workbuddy/ 是本地工作状态
+.workbuddy/
+target.dylib
+macho_*.txt
+
+# 构建产物
+.theos/
+obj/
+*.deb
+packages/
