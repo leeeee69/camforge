@@ -1,5 +1,5 @@
 //
-//  CFMenu.h — 悬浮控制面板（UIWindow，状态栏层级，可拖拽）
+//  CFMenu.h — 悬浮控制面板（UIWindow，可拖拽，可折叠成小气泡）
 //
 
 #import <Foundation/Foundation.h>
@@ -13,7 +13,7 @@ NS_ASSUME_NONNULL_BEGIN
 
 - (void)buildIfNeeded;   ///< 首次调用时建窗（主线程）
 - (void)toggle;          ///< 显示/隐藏
-- (void)refresh;         ///< 刷新按钮与状态文案
+- (void)refresh;         ///< 刷新所有控件状态
 
 @end
 
