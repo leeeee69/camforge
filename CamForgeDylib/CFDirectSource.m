@@ -50,6 +50,8 @@ static BOOL cf_read_full(int fd, void *buf, size_t len) {
     NSMutableData *_audioBuf;
     os_unfair_lock _audioLock;
     BOOL _gotAudio;
+
+    os_unfair_lock _stateLock;   ///< _state 会被收发线程写、主线程（面板）读，必须加锁
 }
 
 - (instancetype)initWithPort:(uint16_t)port {
@@ -59,8 +61,9 @@ static BOOL cf_read_full(int fd, void *buf, size_t len) {
         _clientFD = -1;
         _lock = OS_UNFAIR_LOCK_INIT;
         _audioLock = OS_UNFAIR_LOCK_INIT;
+        _stateLock = OS_UNFAIR_LOCK_INIT;
         _audioBuf = [NSMutableData dataWithCapacity:kCFAudioMaxBytes];
-        _state = [NSString stringWithFormat:@"直连: 等待 PC 连接 (端口 %u)", _port];
+        [self setStateText:[NSString stringWithFormat:@"直连: 等待 PC 连接 (端口 %u)", _port]];
         _rgb = CGColorSpaceCreateDeviceRGB();
     }
     return self;
@@ -73,7 +76,18 @@ static BOOL cf_read_full(int fd, void *buf, size_t len) {
 
 - (uint16_t)port { return _port; }
 
-- (NSString *)sourceName { return _state; }
+- (void)setStateText:(NSString *)text {
+    os_unfair_lock_lock(&_stateLock);
+    _state = [text copy];
+    os_unfair_lock_unlock(&_stateLock);
+}
+
+- (NSString *)sourceName {
+    os_unfair_lock_lock(&_stateLock);
+    NSString *s = _state;
+    os_unfair_lock_unlock(&_stateLock);
+    return s;
+}
 
 - (CGSize)frameSize {
     os_unfair_lock_lock(&_lock);
@@ -94,7 +108,7 @@ static BOOL cf_read_full(int fd, void *buf, size_t len) {
     if (_running) return;
 
     int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) { _state = @"直连: socket 创建失败"; return; }
+    if (fd < 0) { [self setStateText:@"直连: socket 创建失败"]; return; }
 
     int on = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
@@ -108,18 +122,18 @@ static BOOL cf_read_full(int fd, void *buf, size_t len) {
     if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         int e = errno;
         close(fd);
-        _state = [NSString stringWithFormat:@"直连: 端口 %u 被占用 (errno %d)", _port, e];
+        [self setStateText:[NSString stringWithFormat:@"直连: 端口 %u 被占用 (errno %d)", _port, e]];
         return;
     }
     if (listen(fd, 1) < 0) {
         close(fd);
-        _state = @"直连: listen 失败";
+        [self setStateText:@"直连: listen 失败"];
         return;
     }
 
     _listenFD = fd;
     _running = YES;
-    _state = [NSString stringWithFormat:@"直连: 已监听 %u，等 PC 推送", _port];
+    [self setStateText:[NSString stringWithFormat:@"直连: 已监听 %u，等 PC 推送", _port]];
 
     __weak typeof(self) weakSelf = self;
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
@@ -157,13 +171,13 @@ static BOOL cf_read_full(int fd, void *buf, size_t len) {
 
         _clientFD = c;
         _frames = 0;
-        _state = [NSString stringWithFormat:@"直连: PC 已连接 (%u)", _port];
+        [self setStateText:[NSString stringWithFormat:@"直连: PC 已连接 (%u)", _port]];
 
         [self readLoop:c];
 
         close(c);
         _clientFD = -1;
-        _state = [NSString stringWithFormat:@"直连: 已断开，等重连 (%u)", _port];
+        [self setStateText:[NSString stringWithFormat:@"直连: 已断开，等重连 (%u)", _port]];
     }
 }
 
@@ -183,11 +197,11 @@ static BOOL cf_read_full(int fd, void *buf, size_t len) {
                        ((uint32_t)hdr[10] << 16) | ((uint32_t)hdr[11] << 24);
 
         if (magic != kCFMagic || version != kCFVersion) {
-            _state = @"直连: 协议头不匹配（magic/version）";
+            [self setStateText:@"直连: 协议头不匹配（magic/version）"];
             return;
         }
         if (len == 0 || len > kCFMaxPayload) {
-            _state = [NSString stringWithFormat:@"直连: 负载长度异常 %u", len];
+            [self setStateText:[NSString stringWithFormat:@"直连: 负载长度异常 %u", len]];
             return;
         }
 
@@ -205,7 +219,7 @@ static BOOL cf_read_full(int fd, void *buf, size_t len) {
                 _frames++;
                 NSUInteger n = _frames;
                 os_unfair_lock_unlock(&_lock);
-                if (n == 1) _state = [NSString stringWithFormat:@"直连: 已出帧 (%u)", _port];
+                if (n == 1) [self setStateText:[NSString stringWithFormat:@"直连: 已出帧 (%u)", _port]];
             }
         }
         // 其他 type 先忽略（预留音频/控制）

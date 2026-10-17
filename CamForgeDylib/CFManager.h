@@ -63,6 +63,9 @@ typedef NS_ENUM(NSInteger, CFSourceType) {
 /// 目标 App 给 output 配的 videoSettings —— 必须按它出帧，否则下游解析会崩
 - (void)noteVideoOutputSettings:(nullable NSDictionary *)settings;
 
+/// 用真实回调帧的像素格式校正出帧格式（比 videoSettings 可靠）
+- (void)noteIncomingPixelFormat:(OSType)fmt;
+
 /// 把 manager 上的选项同步到转换器
 - (void)syncRenderOptions;
 

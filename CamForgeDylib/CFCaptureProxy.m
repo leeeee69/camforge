@@ -13,8 +13,39 @@
 #import "CFCaptureProxy.h"
 #import "CFManager.h"
 #import "CFLogger.h"
+#import <math.h>
 #import <objc/runtime.h>
 #import <AVFoundation/AVFoundation.h>
+
+/// 连接上的画面旋转角（0/90/180/270）。iOS 17 起用 videoRotationAngle，
+/// 老 API videoOrientation 在 17 SDK 已废弃，直接引用会被 -Werror 拦，故用 pragma 压掉。
+static NSInteger cf_connection_rotation(AVCaptureConnection *c) {
+    if (!c) return 0;
+    if (@available(iOS 17.0, *)) {
+        return (NSInteger)(lround(c.videoRotationAngle / 90.0) * 90);
+    }
+    // videoOrientation + 相关枚举在 17 SDK 已废弃；-Werror 下必须整段压掉
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    NSInteger deg = 0;
+    switch (c.videoOrientation) {
+        case AVCaptureVideoOrientationPortraitUpsideDown: deg = 180; break;
+        case AVCaptureVideoOrientationLandscapeRight:     deg = 270; break;
+        case AVCaptureVideoOrientationLandscapeLeft:      deg = 90;  break;
+        default:                                          deg = 0;   break;
+    }
+#pragma clang diagnostic pop
+    return deg;
+}
+
+static BOOL cf_connection_mirrored(AVCaptureConnection *c) {
+    if (!c) return NO;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    BOOL m = c.isVideoMirrored;
+#pragma clang diagnostic pop
+    return m;
+}
 
 @implementation CFCaptureProxy
 
@@ -89,6 +120,23 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
 
         if (isVideo) { [CFLogger.shared incVideoHookHit]; }
         else         { [CFLogger.shared incAudioHookHit]; }
+
+        // 首帧：读真实 buffer 的像素格式（videoSettings 可能为 nil/滞后，实际格式才算数），
+        // 并把 connection 的朝向/镜像记下来 —— 这两项对不上会表现为画面方向错乱。
+        if (isVideo) {
+            static BOOL loggedOnce = NO;
+            CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(sampleBuffer);
+            if (pb) {
+                OSType fmt = CVPixelBufferGetPixelFormatType(pb);
+                [CFManager.shared noteIncomingPixelFormat:fmt];
+                if (!loggedOnce) {
+                    loggedOnce = YES;
+                    [CFLogger.shared log:@"首帧: %zux%zu fmt=0x%x 朝向=%ld 镜像=%d",
+                        CVPixelBufferGetWidth(pb), CVPixelBufferGetHeight(pb), fmt,
+                        (long)cf_connection_rotation(connection), cf_connection_mirrored(connection)];
+                }
+            }
+        }
 
         CMSampleBufferRef injected = NULL;
         @try {

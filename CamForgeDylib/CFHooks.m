@@ -54,6 +54,33 @@ static void hookAudioSetDelegate(id self, SEL _cmd, id delegate, dispatch_queue_
     }
 }
 
+/// 按类型包装某个 output（幂等）
+static void cf_wrap_output(AVCaptureOutput *o) {
+    if ([o isKindOfClass:[AVCaptureVideoDataOutput class]]) {
+        [CFCaptureProxy wrapVideoOutput:(AVCaptureVideoDataOutput *)o];
+    } else if ([o isKindOfClass:[AVCaptureAudioDataOutput class]]) {
+        [CFCaptureProxy wrapAudioOutput:(AVCaptureAudioDataOutput *)o];
+    }
+}
+
+static void (*g_origAddOutput)(id, SEL, AVCaptureOutput *);
+static void hookAddOutput(id self, SEL _cmd, AVCaptureOutput *output) {
+    g_origAddOutput(self, _cmd, output);
+    if (!output) return;
+
+    @try {
+        cf_wrap_output(output);
+        // 时序兜底：不少 App 是 addOutput → 稍后 setSampleBufferDelegate，
+        // 这里补两次延迟重试（包装本身幂等，重复调用无害）。
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{ cf_wrap_output(output); });
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{ cf_wrap_output(output); });
+    } @catch (NSException *e) {
+        [CFLogger.shared log:@"addOutput 包装异常: %@", e.reason];
+    }
+}
+
 static void (*g_origStartRunning)(id, SEL);
 static void hookStartRunning(id self, SEL _cmd) {
     g_origStartRunning(self, _cmd);
@@ -80,6 +107,10 @@ static void cf_install(void) {
     MSHookMessageEx(objc_getClass("AVCaptureSession"),
                     @selector(startRunning),
                     (IMP)hookStartRunning, (IMP *)&g_origStartRunning);
+    // addOutput 补挂：output 可能在 startRunning 之后才加进来
+    MSHookMessageEx(objc_getClass("AVCaptureSession"),
+                    @selector(addOutput:),
+                    (IMP)hookAddOutput, (IMP *)&g_origAddOutput);
     [CFLogger.shared log:@"MSHookMessageEx hooks installed"];
 }
 

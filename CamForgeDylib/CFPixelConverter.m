@@ -68,6 +68,9 @@
         (id)kCVPixelBufferPixelFormatTypeKey: @(format),
         (id)kCVPixelBufferWidthKey:  @((size_t)size.width),
         (id)kCVPixelBufferHeightKey: @((size_t)size.height),
+        // 下游可能持有若干帧不立刻归还；给足最小缓冲数，避免池子枯竭导致"出不了帧"。
+        // （原版同样设了 kCVPixelBufferPoolMinimumBufferCountKey）
+        (id)kCVPixelBufferPoolMinimumBufferCountKey: @(6),
     };
     CVReturn r = CVPixelBufferPoolCreate(NULL, NULL, (__bridge CFDictionaryRef)props, &_pool);
     if (r != kCVReturnSuccess) _pool = NULL;

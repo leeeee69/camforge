@@ -25,6 +25,7 @@
 #import "CFMenu.h"
 #import <math.h>
 #import <string.h>
+#import <QuartzCore/QuartzCore.h>
 
 #if CF_HAVE_FFMPEG
 #import <libswresample/swresample.h>
@@ -70,8 +71,12 @@ static BOOL cf_block_is_silent(CMBlockBufferRef block, size_t totalBytes) {
 @interface CFManager ()
 @property (nonatomic, assign) CMTime lastPTS;                        ///< 递增 PTS（30fps）
 @property (nonatomic, assign) uint64_t lastVideoDigest;              ///< 画面去重摘要
+@property (nonatomic, assign, nullable) CMSampleBufferRef lastSampleBuffer; ///< 最近一帧（回调比渲染快时复用）
 @property (nonatomic, strong, nullable) dispatch_source_t renderTimer; ///< 渲染节拍器
 - (void)applySourceType:(CFSourceType)type urlOrPath:(nullable NSString *)s;
+- (NSUInteger)scanSessionOutputs:(AVCaptureSession *)session;
+- (void)retryScanSession:(AVCaptureSession *)session attempt:(NSInteger)attempt;
+- (void)resetLastSampleBuffer;
 @end
 
 @implementation CFManager
@@ -115,6 +120,7 @@ static BOOL cf_block_is_silent(CMBlockBufferRef block, size_t totalBytes) {
     }
     self.replacing = YES;
     self.lastError = nil;
+    self.lastPTS = kCMTimeZero;
     [self syncRenderOptions];
     if ([self.source respondsToSelector:@selector(prepare)]) {
         [self.source prepare];
@@ -155,6 +161,7 @@ static BOOL cf_block_is_silent(CMBlockBufferRef block, size_t totalBytes) {
         [self.source teardown];
     }
     [self.jitter drain];
+    [self resetLastSampleBuffer];
     [CFLogger.shared log:@"停止替换（已恢复真实相机）"];
 }
 
@@ -165,6 +172,21 @@ static BOOL cf_block_is_silent(CMBlockBufferRef block, size_t totalBytes) {
     self.converter.rotationDegrees = self.rotationDegrees;
     self.converter.mirrored = self.mirrored;
     self.converter.fillMode = self.fillMode;
+}
+
+/// 从真实回调帧里读像素格式：比 videoSettings 可靠（videoSettings 可能为 nil 或滞后）
+- (void)noteIncomingPixelFormat:(OSType)fmt {
+    if (fmt == 0) return;
+    if (fmt == self.targetPixelFormat) return;
+    if (fmt != kCVPixelFormatType_32BGRA &&
+        fmt != kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange &&
+        fmt != kCVPixelFormatType_420YpCbCr8BiPlanarFullRange) {
+        [CFLogger.shared log:@"回调帧像素格式 0x%x 不支持，保持 0x%x", fmt, self.targetPixelFormat];
+        return;
+    }
+    self.targetPixelFormat = fmt;
+    [self syncRenderOptions];
+    [CFLogger.shared log:@"按实际回调帧修正像素格式 -> 0x%x", fmt];
 }
 
 - (void)noteVideoOutputSettings:(NSDictionary *)settings {
@@ -313,8 +335,14 @@ static BOOL cf_block_is_silent(CMBlockBufferRef block, size_t totalBytes) {
             return;
         }
 
-        // 3) 打包 SampleBuffer，PTS 按 30fps 递增
-        self.lastPTS = CMTimeAdd(self.lastPTS, CMTimeMake(1, 30));
+        // 3) 打包 SampleBuffer。PTS 用墙钟（CACurrentMediaTime），不用帧计数累加：
+        //    按帧计数一旦渲染被拖慢，PTS 就会落后于真实时间，下游按时间轴取帧会丢帧。
+        //    同时保证严格单调（至少 +1/120s），避免重复时间戳被丢弃。
+        CMTime now = CMTimeMakeWithSeconds(CACurrentMediaTime(), 1000);
+        if (CMTimeCompare(now, self.lastPTS) <= 0) {
+            now = CMTimeAdd(self.lastPTS, CMTimeMake(1, 120));
+        }
+        self.lastPTS = now;
         CMSampleTimingInfo timing = {
             .duration = CMTimeMake(1, 30),
             .presentationTimeStamp = self.lastPTS,
@@ -329,6 +357,8 @@ static BOOL cf_block_is_silent(CMBlockBufferRef block, size_t totalBytes) {
             return;
         }
         [self.jitter pushSampleBuffer:sb];
+        [self resetLastSampleBuffer];
+        self.lastSampleBuffer = (CMSampleBufferRef)CFRetain(sb);
         CFRelease(sb);
         self.outputSize = self.converter.outputSize;
         [CFLogger.shared incRendered];
@@ -339,7 +369,24 @@ static BOOL cf_block_is_silent(CMBlockBufferRef block, size_t totalBytes) {
 
 - (CMSampleBufferRef)nextVideoSampleBuffer {
     if (!self.replacing) return NULL;
-    return (CMSampleBufferRef)[self.jitter popRetained];   // +1 或 NULL
+
+    CMSampleBufferRef sb = (CMSampleBufferRef)[self.jitter popRetained];   // +1 或 NULL
+    if (sb) return sb;
+
+    // 关键：App 的回调率可能高于我们的渲染率（抖音常见 60fps 回调 / 我们 30fps 出帧）。
+    // 缓冲空了就复用最近一帧，绝不能透传真画面 —— 否则画面会在假帧与真帧之间交替闪，
+    // 观感上就是"注入没生效"。（原版是靠 Retry 锁 30fps 解决的，我们两头都兜）
+    if (self.lastSampleBuffer) {
+        return (CMSampleBufferRef)CFRetain(self.lastSampleBuffer);          // +1
+    }
+    return NULL;
+}
+
+- (void)resetLastSampleBuffer {
+    if (self.lastSampleBuffer) {
+        CFRelease(self.lastSampleBuffer);
+        self.lastSampleBuffer = NULL;
+    }
 }
 
 - (NSData *)convertPCM:(NSData *)pcm
@@ -486,14 +533,39 @@ static BOOL cf_block_is_silent(CMBlockBufferRef block, size_t totalBytes) {
 - (void)rescanSessionOutputs:(AVCaptureSession *)session {
     if (!session) return;
     [CFLogger.shared incSession];
-    [CFLogger.shared log:@"session startRunning，补扫 outputs: %lu", (unsigned long)session.outputs.count];
+    NSUInteger n = [self scanSessionOutputs:session];
+    [CFLogger.shared log:@"session startRunning，outputs=%lu", (unsigned long)n];
+    // 输出有可能在 startRunning 之后才被 addOutput（部分 App 就是这么干的），
+    // 原版的日志里也是"retry ... attempt %ld"，我们同样补扫几次。
+    if (n == 0) [self retryScanSession:session attempt:1];
+}
+
+- (NSUInteger)scanSessionOutputs:(AVCaptureSession *)session {
+    NSUInteger n = 0;
     for (AVCaptureOutput *o in session.outputs) {
         if ([o isKindOfClass:[AVCaptureVideoDataOutput class]]) {
             [CFCaptureProxy wrapVideoOutput:(AVCaptureVideoDataOutput *)o];
+            n++;
         } else if ([o isKindOfClass:[AVCaptureAudioDataOutput class]]) {
             [CFCaptureProxy wrapAudioOutput:(AVCaptureAudioDataOutput *)o];
+            n++;
         }
     }
+    return n;
+}
+
+- (void)retryScanSession:(AVCaptureSession *)session attempt:(NSInteger)attempt {
+    if (attempt > 3) {
+        [CFLogger.shared log:@"补扫 3 次仍无输出：该 App 可能不走 AVCaptureSession"];
+        return;
+    }
+    __weak typeof(self) weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * attempt * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        NSUInteger n = [weakSelf scanSessionOutputs:session];
+        [CFLogger.shared log:@"补扫第 %ld 次: outputs=%lu", (long)attempt, (unsigned long)n];
+        if (n == 0) [weakSelf retryScanSession:session attempt:attempt + 1];
+    });
 }
 
 - (void)showMenu {
