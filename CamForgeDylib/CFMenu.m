@@ -79,7 +79,7 @@ static const CGFloat kPanelH = 268;
     UIStackView *stack = [[UIStackView alloc] initWithArrangedSubviews:@[
         title, self.statusLabel, self.replaceButton, self.sourceButton, self.audioButton, diag, hide
     ]];
-    stack.axis = UIAxisVertical;
+    stack.axis = UILayoutConstraintAxisVertical;
     stack.spacing = 8;
     stack.translatesAutoresizingMaskIntoConstraints = NO;
     [vc.view addSubview:stack];
