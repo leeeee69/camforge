@@ -18,6 +18,9 @@
 #import "CFLogger.h"
 #import "CFSyntheticSource.h"
 #import "CFAssetSource.h"
+#import "CFAlbumSource.h"
+#import "CFExternalSource.h"
+#import "CFMovieSource.h"
 #import "CFMenu.h"
 #import <math.h>
 #import <string.h>
@@ -100,9 +103,9 @@ static BOOL cf_block_is_silent(CMBlockBufferRef block, size_t totalBytes) {
 
 - (void)startReplacing {
     if (self.replacing) return;
-    if (self.sourceType == CFSourceTypeDirect) {
-        self.lastError = @"直连模式不注入，切到「视频」或「网络」再开始";
-        [CFLogger.shared log:@"startReplacing 被拒绝：当前为直连模式"];
+    if (self.sourceType == CFSourceTypePassthrough) {
+        self.lastError = @"当前是相机透传模式，切到「视频」「网络」或「直连」再开始";
+        [CFLogger.shared log:@"startReplacing 被拒绝：透传模式"];
         return;
     }
     self.replacing = YES;
@@ -196,32 +199,72 @@ static BOOL cf_block_is_silent(CMBlockBufferRef block, size_t totalBytes) {
 }
 
 - (void)applySourceType:(CFSourceType)type urlOrPath:(NSString *)s {
-    self.sourceType = type;
+    [self syncRenderOptions];
     if ([self.source respondsToSelector:@selector(teardown)]) {
         [self.source teardown];
     }
+
     switch (type) {
         case CFSourceTypeVideoFile:
-            self.source = [[CFAssetSource alloc] initWithURL:[NSURL fileURLWithPath:s ?: @""]];
+            if (s.length == 0) {
+                // 视频模式留空 = 用相册最新一条
+                self.source = [CFAlbumSource new];
+                self.sourceType = CFSourceTypeAlbum;
+            } else {
+                self.source = [[CFAssetSource alloc] initWithURL:[NSURL fileURLWithPath:s]];
+                self.sourceType = CFSourceTypeVideoFile;
+            }
             break;
-        case CFSourceTypeNetwork:
-            self.source = [[CFAssetSource alloc] initWithURL:[NSURL URLWithString:s ?: @""]];
+
+        case CFSourceTypeAlbum:
+            self.source = [CFAlbumSource new];
+            self.sourceType = CFSourceTypeAlbum;
             break;
-        case CFSourceTypeDirect:
-            // 直连 = 相机原样透传，不注入
+
+        case CFSourceTypeNetwork: {
+            NSString *lower = s.lowercaseString ?: @"";
+            BOOL needFFmpeg = [lower hasPrefix:@"rtsp://"] ||
+                              [lower hasPrefix:@"rtmp://"] ||
+                              [lower containsString:@".flv"];
+            if (needFFmpeg) {
+                if ([CFMovieSource available]) {
+                    self.source = [[CFMovieSource alloc] initWithURLString:s isFile:NO];
+                    self.sourceType = CFSourceTypeNetwork;
+                } else {
+                    self.lastError = @"RTSP/RTMP/FLV 需要 FFmpeg，当前构建未包含";
+                    self.source = [CFSyntheticSource new];
+                    self.sourceType = CFSourceTypeSynthetic;
+                }
+            } else {
+                // http(s) / HLS / mp4 交给 AVFoundation，比 FFmpeg 更省资源
+                self.source = [[CFAssetSource alloc] initWithURL:[NSURL URLWithString:s]];
+                self.sourceType = CFSourceTypeNetwork;
+            }
+            break;
+        }
+
+        case CFSourceTypeUSB:
+            self.source = [CFExternalSource new];
+            self.sourceType = CFSourceTypeUSB;
+            break;
+
+        case CFSourceTypePassthrough:
             [self stopReplacing];
             self.source = [CFSyntheticSource new];
+            self.sourceType = CFSourceTypePassthrough;
             break;
+
         default:
             self.source = [CFSyntheticSource new];
             self.sourceType = CFSourceTypeSynthetic;
             break;
     }
+
     if (self.replacing && [self.source respondsToSelector:@selector(prepare)]) {
         [self.source prepare];
     }
     [self.menu refresh];
-    [CFLogger.shared log:@"切换源: %@", self.source.sourceName];
+    [CFLogger.shared log:@"切换源: %@ (%ld)", self.source.sourceName, (long)self.sourceType];
 }
 
 - (CFMenu *)menu {

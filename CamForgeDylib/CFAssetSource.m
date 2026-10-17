@@ -19,6 +19,7 @@
 
 @implementation CFAssetSource {
     NSURL *_url;
+    AVAsset *_providedAsset;     ///< 相册来源直接给 AVAsset
     AVURLAsset *_asset;
     AVAssetReader *_reader;
     AVAssetReaderTrackOutput *_trackOut;
@@ -33,13 +34,24 @@
     return self;
 }
 
+- (instancetype)initWithAsset:(AVAsset *)asset {
+    if ((self = [super init])) {
+        _providedAsset = asset;
+        _restartFailures = 0;
+    }
+    return self;
+}
+
 - (NSString *)sourceName {
-    return _url.lastPathComponent.length ? _url.lastPathComponent : (_url.absoluteString ?: @"");
+    if (_url) {
+        return _url.lastPathComponent.length ? _url.lastPathComponent : (_url.absoluteString ?: @"");
+    }
+    return _providedAsset ? @"相册视频" : @"";
 }
 
 - (CGSize)frameSize {
-    AVAssetTrack *t = [[[AVURLAsset URLAssetWithURL:_url options:nil]
-                        tracksWithMediaType:AVMediaTypeVideo] firstObject];
+    AVAsset *a = _providedAsset ?: [AVURLAsset URLAssetWithURL:_url options:nil];
+    AVAssetTrack *t = [[a tracksWithMediaType:AVMediaTypeVideo] firstObject];
     return t ? t.naturalSize : CGSizeMake(1280, 720);
 }
 
@@ -49,6 +61,7 @@
     _reader = nil;
     _trackOut = nil;
     _asset = nil;
+    _restartFailures = 0;
 }
 
 - (BOOL)restartReader {
@@ -56,7 +69,9 @@
 
     _reader = nil;
     _trackOut = nil;
-    _asset = [AVURLAsset URLAssetWithURL:_url options:nil];
+    // 相册来源用给进来的 AVAsset；URL 来源每次重建（网络流 EOF 后能重新拉）
+    _asset = _providedAsset ? (_asset ?: (AVURLAsset *)_providedAsset)
+                            : [AVURLAsset URLAssetWithURL:_url options:nil];
     if (!_asset) { _restartFailures++; return NO; }
 
     AVAssetTrack *track = [[_asset tracksWithMediaType:AVMediaTypeVideo] firstObject];

@@ -21,6 +21,8 @@
 #import "CFMenu.h"
 #import "CFManager.h"
 #import "CFLogger.h"
+#import "CFMovieSource.h"
+#import "CFExternalSource.h"
 #import <UIKit/UIKit.h>
 #import <QuartzCore/QuartzCore.h>
 #import <math.h>
@@ -486,10 +488,8 @@ typedef NS_ENUM(NSInteger, CFUiMode) {
 
 - (void)onMode:(UIButton *)sender {
     self.uiMode = (CFUiMode)sender.tag;
-    if (self.uiMode == CFUiModeDirect) {
-        [CFManager.shared stopReplacing];
-        [CFManager.shared switchToSourceType:CFSourceTypeDirect urlOrPath:nil];
-    }
+    // 换模式先停注入，避免旧源继续往新模式下灌帧
+    [CFManager.shared stopReplacing];
     [self refresh];
 }
 
@@ -508,43 +508,60 @@ typedef NS_ENUM(NSInteger, CFUiMode) {
     NSString *s = [self.field.text stringByTrimmingCharactersInSet:
                    [NSCharacterSet whitespaceAndNewlineCharacterSet]];
     CFManager *m = CFManager.shared;
+    m.lastError = nil;
 
     if (self.uiMode == CFUiModeDirect) {
-        [m switchToSourceType:CFSourceTypeDirect urlOrPath:nil];
-        [self refresh];
-        return;
-    }
-    if (!s.length) {
-        m.lastError = @"请先输入地址或视频路径";
-        [self refresh];
+        if (![CFExternalSource supported]) {
+            m.lastError = @"USB 直通需 iOS 17+ 且 USB-C 外接摄像头";
+            [self refresh];
+            return;
+        }
+        [m switchToSourceType:CFSourceTypeUSB urlOrPath:nil];
+        [m startReplacing];
+        if (!m.replacing) [self refresh];
         return;
     }
 
     if (self.uiMode == CFUiModeNetwork) {
+        if (!s.length) {
+            m.lastError = @"请先输入拉流地址";
+            [self refresh];
+            return;
+        }
         NSString *lower = s.lowercaseString;
-        if ([lower hasPrefix:@"rtsp://"] || [lower hasPrefix:@"rtmp://"]) {
-            m.lastError = @"RTSP/RTMP 需 FFmpeg，本工程未内置，请用 http(s)/m3u8/mp4";
+        BOOL ok = [lower hasPrefix:@"rtsp://"] || [lower hasPrefix:@"rtmp://"] ||
+                  [lower hasPrefix:@"http://"] || [lower hasPrefix:@"https://"];
+        if (!ok) {
+            m.lastError = @"地址需以 rtsp:// rtmp:// http:// https:// 开头";
             [self refresh];
             return;
         }
-        if (![lower hasPrefix:@"http://"] && ![lower hasPrefix:@"https://"]) {
-            m.lastError = @"网络模式需要 http(s) 地址";
+        if (([lower hasPrefix:@"rtsp://"] || [lower hasPrefix:@"rtmp://"]) &&
+            ![CFMovieSource available]) {
+            m.lastError = @"本 dylib 未编译 FFmpeg，RTSP/RTMP 不可用";
             [self refresh];
             return;
         }
-        m.lastError = nil;
         [m switchToSourceType:CFSourceTypeNetwork urlOrPath:s];
         [m startReplacing];
-    } else {
-        if (![s hasPrefix:@"/"]) {
-            m.lastError = @"本地视频请填绝对路径（以 / 开头）";
-            [self refresh];
-            return;
-        }
-        m.lastError = nil;
-        [m switchToSourceType:CFSourceTypeVideoFile urlOrPath:s];
-        [m startReplacing];
+        [self refresh];
+        return;
     }
+
+    // 视频模式：留空 = 相册最新一条；填了 = 本地文件
+    if (!s.length) {
+        [m switchToSourceType:CFSourceTypeAlbum urlOrPath:nil];
+        [m startReplacing];
+        [self refresh];
+        return;
+    }
+    if (![s hasPrefix:@"/"]) {
+        m.lastError = @"本地视频请填绝对路径（以 / 开头）；留空则用相册最新";
+        [self refresh];
+        return;
+    }
+    [m switchToSourceType:CFSourceTypeVideoFile urlOrPath:s];
+    [m startReplacing];
     [self refresh];
 }
 
@@ -738,17 +755,19 @@ typedef NS_ENUM(NSInteger, CFUiMode) {
 
     // 地址行随模式变
     if (self.uiMode == CFUiModeNetwork) {
-        self.urlLabel.text = @"🌐  网络拉流地址";
-        self.field.placeholder = @"http(s):// … .m3u8 / .mp4";
-        self.hintLabel.text = @"支持 http(s)/HLS/mp4；RTSP·RTMP 需 FFmpeg，本版未内置。";
+        self.urlLabel.text = @"🌐  拉流地址（RTSP / RTMP / FLV / HLS）";
+        self.field.placeholder = @"rtsp:// | rtmp:// | http(s)://…";
+        self.hintLabel.text = [CFMovieSource available]
+            ? @"RTSP/RTMP/FLV 走 FFmpeg 软解；http(s)/HLS 走系统解码。"
+            : @"本构建未含 FFmpeg：RTSP/RTMP/FLV 不可用，仅 http(s)/HLS。";
     } else if (self.uiMode == CFUiModeDirect) {
-        self.urlLabel.text = @"🔌  直连（相机透传，不注入）";
-        self.field.placeholder = @"此模式无需地址，用于 A/B 对照";
-        self.hintLabel.text = @"直连模式把真实相机原样交给 App，用来对照注入效果。";
+        self.urlLabel.text = @"🔌  USB 外部摄像头直通";
+        self.field.placeholder = @"此模式不用地址（需 iOS 17+ 外接摄像头）";
+        self.hintLabel.text = @"用外部摄像头（USB-C UVC）出帧当源；无设备会提示。";
     } else {
-        self.urlLabel.text = @"🎬  本地视频路径";
-        self.field.placeholder = @"/var/mobile/Media/test.mp4";
-        self.hintLabel.text = @"填本地视频绝对路径后点「加载」，循环播放并注入。";
+        self.urlLabel.text = @"🎬  本地视频路径（留空 = 相册最新）";
+        self.field.placeholder = @"/var/mobile/Media/test.mp4（可留空）";
+        self.hintLabel.text = @"填绝对路径读本地视频，留空则取相册最新一条，循环注入。";
     }
 
     // 功能格

@@ -13,6 +13,9 @@ NS_ASSUME_NONNULL_BEGIN
 
 - (instancetype)initWithURL:(NSURL *)url;
 
+/// 直接用一个已就绪的 AVAsset 作源（相册取到的 asset 走这条）
+- (instancetype)initWithAsset:(AVAsset *)asset;
+
 @end
 
 NS_ASSUME_NONNULL_END

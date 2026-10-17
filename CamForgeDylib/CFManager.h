@@ -15,8 +15,10 @@ NS_ASSUME_NONNULL_BEGIN
 typedef NS_ENUM(NSInteger, CFSourceType) {
     CFSourceTypeSynthetic = 0,  ///< 内置合成测试图案（默认，零依赖）
     CFSourceTypeVideoFile,      ///< 本地视频文件（AVAssetReader 循环播放）
-    CFSourceTypeNetwork,        ///< 网络流 HTTP/HLS（AVURLAsset）
-    CFSourceTypeDirect,         ///< 直连：相机原样透传，不注入（A/B 对照）
+    CFSourceTypeNetwork,        ///< 网络流：RTSP/RTMP/HTTP-FLV 走 FFmpeg，http(s)/HLS 走 AVFoundation
+    CFSourceTypeAlbum,          ///< 相册最新一条视频
+    CFSourceTypeUSB,            ///< 外部摄像头直通（iOS 17+ AVCaptureDeviceTypeExternal）
+    CFSourceTypePassthrough,    ///< 相机原样透传，不注入（A/B 对照）
 };
 
 /// 帧源协议：所有源统一输出 BGRA CVPixelBuffer（返回 +1，调用方负责释放）
