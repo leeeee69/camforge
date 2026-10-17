@@ -5,13 +5,18 @@
     <key>Filter</key>
     <dict>
         <!--
-          Substrate 目录部署用：只注入抖音。
+          Substrate 目录部署用：按 Bundles 逐个注入。
           注意：plist 文件名必须与 dylib 主名一致（libCamForge.dylib <-> libCamForge.plist）。
+
+          新增宿主时，这里和 CFHooks.m 的 cf_targetBundleIDs() 必须同步改，
+          否则会「dylib 加载了但构造器 guard 直接 return」，表现为没有面板。
+
           若改用 insert_dylib / DYLD 方式，此 plist 不参与，进程 guard 在 CFHooks.m 里兜底。
         -->
         <key>Bundles</key>
         <array>
             <string>com.ss.iphone.ugc.Aweme</string>
+            <string>com.tencent.xin</string>
         </array>
     </dict>
 </dict>
