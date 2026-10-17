@@ -27,7 +27,7 @@
 
     AVFormatContext *_fmt;
     AVCodecContext *_dec;
-    SwsContext *_sws;
+    struct SwsContext *_sws;
     AVPacket *_pkt;
     AVFrame *_frame;
     int _streamIndex;
