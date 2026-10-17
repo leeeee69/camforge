@@ -20,8 +20,11 @@
     id current = output.sampleBufferDelegate;
     if (current != proxy) {
         // 先记住 App 的真 delegate，再把代理塞进去
+        // （iOS 17 SDK 起 sampleBufferDelegate 为 readonly，必须走 setSampleBufferDelegate:queue:；
+        //   queue 沿用 App 原先那个，回调线程不变）
         proxy.videoOriginal = current;
-        output.sampleBufferDelegate = proxy;   // 会再次进入被 hook 的 setter，此时 delegate 已是 proxy，直接透传
+        [output setSampleBufferDelegate:proxy queue:output.sampleBufferCallbackQueue];
+        // 会再次进入被 hook 的 setter，此时 delegate 已是 proxy，直接透传
         [CFLogger.shared log:@"video delegate 已包装: %@ -> %@", current, output];
     }
 }
@@ -36,7 +39,7 @@
     id current = output.sampleBufferDelegate;
     if (current != proxy) {
         proxy.audioOriginal = current;
-        output.sampleBufferDelegate = proxy;
+        [output setSampleBufferDelegate:proxy queue:output.sampleBufferCallbackQueue];
         [CFLogger.shared log:@"audio delegate 已包装: %@ -> %@", current, output];
     }
 }
