@@ -28,13 +28,17 @@ jobs:
           git clone --depth 1 --recursive https://github.com/theos/theos.git "$HOME/theos"
           echo "THEOS=$HOME/theos" >> "$GITHUB_ENV"
 
-      # iOS SDK：theos/sdks 的 release tag 是动态的（master-<commit>），
-      # 先用 API 解析 latest tag 再下载，防止硬编码 tag 失效。
+      # iOS SDK：tag 固定为 master-146e41f（已验证可用）。
+      # 不用 API 动态解析 latest —— runner 共享 IP，未认证 API 有 60 次/时限流，
+      # 解析失败会拿到 null tag 下载到 404 页面（2026-10-17 实测踩坑）。
+      # theos/sdks 的 release 资产永久保留，固定 tag 不会失效。
+      # 注意：theos 实际选用 Xcode 内置的最高版本 SDK（当前 runner 为 iPhoneOS17.5），
+      # 这里下载的 16.5 仅作 SDK 查找兜底。
       # 换 SDK 版本改下面文件名即可（如 iPhoneOS15.6.sdk.tar.xz）。
       - name: Install iOS SDK
         run: |
           mkdir -p "$THEOS/sdks" && cd "$THEOS/sdks"
-          SDK_TAG=$(curl -sL https://api.github.com/repos/theos/sdks/releases/latest | jq -r .tag_name)
+          SDK_TAG=master-146e41f
           echo "using theos/sdks release: $SDK_TAG"
           curl -L -o iPhoneOS16.5.sdk.tar.xz "https://github.com/theos/sdks/releases/download/$SDK_TAG/iPhoneOS16.5.sdk.tar.xz"
           tar -xf iPhoneOS16.5.sdk.tar.xz
