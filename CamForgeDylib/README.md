@@ -47,20 +47,57 @@
 
 > 说明：参考实现里的「AI 话术」是真接了模型/接口的；本工程刻意不联网，所以这里是**离线内置话术轮播**，功能形态一致但不含任何网络调用。
 
-## 1.2 为什么产物只有几百 K（原版 6.3 MB）
+## 1.2 体积构成（v0.4 内置 FFmpeg 后）
 
-不是功能缺失导致的体积差异，主要是这几块原版有、自研版刻意没有的东西：
+| 版本 | dylib | 说明 |
+|---|---|---|
+| v0.3（无 FFmpeg） | 567 KB | 只支持 AVFoundation 能解的 http(s)/HLS/mp4 |
+| **v0.4（含 FFmpeg）** | **9.78 MB** | 双架构各 ~4.9 MB，多了 RTSP/RTMP/HTTP-FLV 软解 |
 
-| 原版占体积的部分 | 本工程 |
-|---|---|
-| 内置 FFmpeg + NEON 汇编（解 RTSP/RTP/HTTP-FLV） | ❌ 未链，约 3–4 MB 就省在这里；用 AVFoundation 只支持 http(s)/HLS/mp4 |
-| 图标/公告图/字体等资源包 | ❌ 界面用 SF Symbols，无位图资源 |
-| 卡密授权、反调试、反篡改双签、隐形水印、语音克隆客户端 | ❌ 全部不 port |
-| 五路源 + USB 直通等分支代码 | ⚠️ 只保留三路 + 直连 |
-| 调试符号 | ✅ 两个架构的 dSYM 都不进交付物（CI 里只上传 dylib+plist） |
+FFmpeg 是 CI 里交叉编译的**静态库**（arm64 + arm64e 各编一遍再 lipo 合成 fat），只开了必要组件：
+rtsp/rtmp/http/hls 协议 + flv/mpegts/mp4 解封装 + h264/hevc/aac 解码 + swscale。
+没开 GPL 组件（不含 x264/x265），许可证是 LGPL-2.1+。
 
-现在交付的 dylib 是 **566 KB**（arm64 + arm64e 两个切片）。真需要 RTSP，唯一办法是把 FFmpeg 链进来，体积会直接回到 4–5 MB 量级——那是另一个工程量，不是改几行代码。
+原版 6.3 MB 是**单架构**；我们是双架构 fat，所以更大。要缩体积可以：
+- 只留 arm64（改 Makefile 的 `ARCHS`）→ 约 5 MB
+- 再砍 hevc/mp3 解码 → 约 4 MB
 
+## 1.3 五路视频源
+
+| 源 | 实现 | 依赖 |
+|---|---|---|
+| 合成图案 | CoreGraphics 逐帧绘制（帧号烧录） | 无 |
+| 本地视频 | AVAssetReader 循环播放 | 系统 |
+| 相册最新 | PHAsset → AVAsset → AVAssetReader | 相册权限（用宿主 App 的） |
+| 网络流 · RTSP/RTMP/HTTP-FLV | **FFmpeg** 软解 → BGRA | 内置 FFmpeg |
+| 网络流 · http(s)/HLS/mp4 | AVFoundation | 系统 |
+| **直连（USB 数据线）** | 手机监听 TCP，PC 经 **usbmuxd** 推 JPEG 帧 | PC 端 `iproxy` + `tools/cf-push.py` |
+| 相机透传 | 不注入，原样交给 App（A/B 对照） | 无 |
+
+> ⚠️ 关于「USB 直连」的真相：原版**不是**越狱层 USB 协议栈。它的字符串写着
+> `direct-connect: listening on port %u (pc pushes via usbmuxd)`——就是手机侧开个 TCP
+> 端口、PC 通过 usbmuxd（iTunes 那套端口转发）推流。我们复刻的就是这条通道，
+> 只是帧协议自己定（JPEG 逐帧，避开 H.264 参数集对齐的坑）。
+
+### 直连怎么用
+
+```bash
+# 1) 电脑上装 libimobiledevice（macOS: brew install libimobiledevice）
+# 2) 转发端口（保持运行）
+iproxy 9527 9527
+
+# 3) 推视频文件（二选一）
+python tools/cf-push.py /path/to/video.mp4
+# 推电脑的 USB 摄像头
+python tools/cf-push.py --camera 0
+
+# 带宽紧张时降规格
+python tools/cf-push.py video.mp4 --fps 15 --width 960 --height 540 --quality 60
+```
+
+手机上：面板切到「直连」→「加载」，状态行显示「已监听 9527」，PC 连上后变「已出帧」。
+
+PC 端依赖：优先 OpenCV（`pip install opencv-python`），没有就自动退回调用 `ffmpeg` CLI。
 
 ## 2. 与 tweak 版（CamForge/）的差异
 
@@ -87,6 +124,12 @@ CamForgeDylib/
 ├── CFCaptureProxy.h/.m    # 委托代理（幂等包装，didOutputSampleBuffer 换帧）
 ├── CFSyntheticSource.h/.m # 合成图案源（渐变+移动色块+帧号烧录）
 ├── CFAssetSource.h/.m     # AVAssetReader 本地/网络视频源（EOF 循环）
+├── CFAlbumSource.h/.m     # 相册最新视频（PHAsset → AVAsset）
+├── CFMovieSource.h/.m     # FFmpeg 拉流：RTSP/RTMP/HTTP-FLV（软解 → BGRA）
+├── CFDirectSource.h/.m    # 直连：监听 TCP，收 PC 经 usbmuxd 推来的 JPEG 帧
+├── CFExternalSource.h/.m  # 备用：iOS 17+ 外部摄像头（AVCaptureDeviceTypeExternal）
+├── tools/cf-push.py       # PC 端推送脚本（视频文件 / USB 摄像头）
+├── vendor/build-ffmpeg.sh # CI 里交叉编译 FFmpeg 静态库
 ├── CFPixelConverter.h/.m  # CIContext render → NV12 CVPixelBufferPool
 ├── CFJitterBuffer.h/.m    # 4 槽环形抖动缓冲（os_unfair_lock）
 ├── CFLogger.h/.m          # 诊断埋点：6 计数器 + 50 条事件流水
