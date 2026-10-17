@@ -117,8 +117,10 @@ git push -u origin main
 push 后自动触发编译；也可以进仓库 **Actions → Build libCamForge.dylib → Run workflow** 手动触发。
 编完在 run 页面底部 **Artifacts** 下载 `libCamForge.zip`，里面就是 `libCamForge.dylib` + `libCamForge.plist`，拷到设备 `/Library/MobileSubstrate/DynamicLibraries/` 即用。
 
-- workflow 在 `macos-14` runner 上跑：自动装 ldid → clone theos → 按 latest tag 下载 `iPhoneOS16.5.sdk` → `./build.sh`
-- 换 SDK 版本：改 workflow 里 `iPhoneOS16.5.sdk.tar.xz` 的文件名
+- workflow 在 `macos-14` runner 上跑：自动装 ldid → clone theos → **固定 tag `master-146e41f`** 下载 `iPhoneOS16.5.sdk` → `./build.sh`
+- SDK tag 故意固定不死抓 latest：runner 共享 IP，未认证 GitHub API 有 60 次/时限流，动态解析会拿到 `null` tag 下载到 404 页面（2026-10-17 实测）；theos/sdks 的 release 资产永久保留，固定 tag 不会失效
+- 换 SDK 版本：改 workflow 里 `iPhoneOS16.5.sdk.tar.xz` 的文件名和对应 tag
+- `build.sh` 的产物挑选按 Mach-O 头筛选（fat 合并产物优先，排除 dSYM 里的 DWARF 文件——dsymutil 会把调试信息也命名成 `CamForge.dylib`，`find | head -1` 随机抓中过，交付物直接废掉）
 - ⚠️ `.gitignore` 已排除原版二进制（`target.dylib`）和逆向证据（`macho_*.txt`）——**这些绝不能进公开仓库**
 - 公开仓库 = 代码公开，介意者用私有仓库（Actions 对私有仓库同样免费）
 
