@@ -97,7 +97,24 @@ python tools/cf-push.py video.mp4 --fps 15 --width 960 --height 540 --quality 60
 
 手机上：面板切到「直连」→「加载」，状态行显示「已监听 9527」，PC 连上后变「已出帧」。
 
-PC 端依赖：优先 OpenCV（`pip install opencv-python`），没有就自动退回调用 `ffmpeg` CLI。
+**音频**：脚本会把输入文件的音轨转成 s16le / 44.1k / 2ch 一起推（20ms 一包）。
+手机侧用 libswresample 重采样到目标 App 实际要的采样率/声道数再喂进去；推流音频没到时
+自动回落到 440Hz 标记音。诊断面板里 `directAudio(推流音频帧)` 就是走推流音频的次数。
+不想推音频加 `--no-audio`（省带宽）。
+
+PC 端依赖：优先 OpenCV（`pip install opencv-python`），没有就自动退回调用 `ffmpeg` CLI；
+音频必须有 `ffmpeg`（OpenCV 不处理音轨）。
+
+### 帧协议（自己写发送端时看这里）
+
+```
+header 12B: magic "CFRM"(LE u32 0x4D524643) | version 0x01 | type | resv 2B | length u32 LE
+type 0x01 = JPEG 视频整帧
+type 0x02 = PCM 音频（s16le 交错，44100Hz / 2ch / 每包 20ms = 1764B）
+```
+
+> 这是**我们自己的**帧格式，不与原版 PC 端工具线格式兼容——原版 magic/type 值没公开，
+> 我们没有去逆向它的私有协议。用 `tools/cf-push.py` 或按上表自己写发送端都行。
 
 ## 2. 与 tweak 版（CamForge/）的差异
 
@@ -204,6 +221,7 @@ push 后自动触发编译；也可以进仓库 **Actions → Build libCamForge.
 - workflow 在 `macos-14` runner 上跑：自动装 ldid → clone theos → **固定 tag `master-146e41f`** 下载 `iPhoneOS16.5.sdk` → `./build.sh`
 - SDK tag 故意固定不死抓 latest：runner 共享 IP，未认证 GitHub API 有 60 次/时限流，动态解析会拿到 `null` tag 下载到 404 页面（2026-10-17 实测）；theos/sdks 的 release 资产永久保留，固定 tag 不会失效
 - 换 SDK 版本：改 workflow 里 `iPhoneOS16.5.sdk.tar.xz` 的文件名和对应 tag
+- workflow 带 **FFmpeg 静态库缓存**（`actions/cache`，key 含 `build-ffmpeg.sh` 哈希）：首次冷构建约 3 分钟，命中缓存约 1 分钟
 - `build.sh` 的产物挑选按 Mach-O 头筛选（fat 合并产物优先，排除 dSYM 里的 DWARF 文件——dsymutil 会把调试信息也命名成 `CamForge.dylib`，`find | head -1` 随机抓中过，交付物直接废掉）
 - ⚠️ `.gitignore` 已排除原版二进制（`target.dylib`）和逆向证据（`macho_*.txt`）——**这些绝不能进公开仓库**
 - 公开仓库 = 代码公开，介意者用私有仓库（Actions 对私有仓库同样免费）
