@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Filter</key>
+    <dict>
+        <!--
+          抖音实验目标。
+          换回自建 demo App 验证时，把 com.ss.iphone.ugc.Aweme 换成你的 bundle id。
+          抖音会随功能切换（拍摄/直播/视频通话）重建 AVCaptureSession，
+          Tweak.xm 里对 startRunning 的补扫 + 诊断计数会告诉你 hook 是否命中。
+        -->
+        <key>Bundles</key>
+        <array>
+            <string>com.ss.iphone.ugc.Aweme</string>
+        </array>
+    </dict>
+</dict>
+</plist>
