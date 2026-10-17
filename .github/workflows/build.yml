@@ -44,6 +44,16 @@ jobs:
           tar -xf iPhoneOS16.5.sdk.tar.xz
           ls
 
+      # FFmpeg 静态库缓存（arm64 + arm64e）
+      # build.sh 的逻辑：vendor/ffmpeg/lib/libavformat.a 存在就跳过编译，直接链接。
+      # key 里带构建脚本哈希 —— 改了 build-ffmpeg.sh 会自动失效重建。
+      # 冷构建约 2 分钟，命中缓存后直接省掉。
+      - name: Cache FFmpeg
+        uses: actions/cache@v4
+        with:
+          path: CamForgeDylib/vendor/ffmpeg
+          key: ffmpeg-6.1.2-${{ runner.os }}-${{ hashFiles('CamForgeDylib/vendor/build-ffmpeg.sh') }}
+
       # 编译（Makefile: library.mk，产出 .theos/.../*.dylib，build.sh 拷出并签名）
       - name: Build
         working-directory: CamForgeDylib
