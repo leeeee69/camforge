@@ -72,11 +72,15 @@ static BOOL cf_block_is_silent(CMBlockBufferRef block, size_t totalBytes) {
 @property (nonatomic, assign) CMTime lastPTS;                        ///< 递增 PTS（30fps）
 @property (nonatomic, assign) uint64_t lastVideoDigest;              ///< 画面去重摘要
 @property (nonatomic, assign, nullable) CMSampleBufferRef lastSampleBuffer; ///< 最近一帧（回调比渲染快时复用）
+@property (nonatomic, assign, nullable) CVPixelBufferRef lastPixelBuffer;      ///< 最近一个像素缓冲（供原帧重建）
+@property (nonatomic, assign) CGSize cameraSize;                                ///< 相机实际输出尺寸（0 表示未知）
 @property (nonatomic, strong, nullable) dispatch_source_t renderTimer; ///< 渲染节拍器
 - (void)applySourceType:(CFSourceType)type urlOrPath:(nullable NSString *)s;
 - (NSUInteger)scanSessionOutputs:(AVCaptureSession *)session;
 - (void)retryScanSession:(AVCaptureSession *)session attempt:(NSInteger)attempt;
 - (void)resetLastSampleBuffer;
+- (CVPixelBufferRef)dequeuePixelBuffer;
+- (void)noteCameraSize:(CGSize)size;
 @end
 
 @implementation CFManager
@@ -162,6 +166,8 @@ static BOOL cf_block_is_silent(CMBlockBufferRef block, size_t totalBytes) {
     }
     [self.jitter drain];
     [self resetLastSampleBuffer];
+    self.cameraSize = CGSizeZero;
+    self.converter.targetSize = CGSizeZero;
     [CFLogger.shared log:@"停止替换（已恢复真实相机）"];
 }
 
@@ -359,6 +365,7 @@ static BOOL cf_block_is_silent(CMBlockBufferRef block, size_t totalBytes) {
         [self.jitter pushSampleBuffer:sb];
         [self resetLastSampleBuffer];
         self.lastSampleBuffer = (CMSampleBufferRef)CFRetain(sb);
+        self.lastPixelBuffer = (CVPixelBufferRef)CFRetain(out);
         CFRelease(sb);
         self.outputSize = self.converter.outputSize;
         [CFLogger.shared incRendered];
@@ -366,6 +373,62 @@ static BOOL cf_block_is_silent(CMBlockBufferRef block, size_t totalBytes) {
 }
 
 #pragma mark - 供 proxy 调用
+
+/// 取一帧待注入的图像（+1）：优先新帧，缓冲空了复用上一帧
+- (CVPixelBufferRef)dequeuePixelBuffer {
+    CMSampleBufferRef sb = (CMSampleBufferRef)[self.jitter popRetained];
+    CVPixelBufferRef pb = NULL;
+    if (sb) {
+        pb = CMSampleBufferGetImageBuffer(sb);          // +0
+        if (pb) CVPixelBufferRetain(pb);
+        CFRelease(sb);
+    }
+    if (!pb && self.lastPixelBuffer) {
+        pb = (CVPixelBufferRef)CFRetain(self.lastPixelBuffer);
+    }
+    return pb;                                          // +1 或 NULL
+}
+
+/// 注入帧构造：**用原帧的格式描述和原帧时间戳**（对应原版
+/// copySampleBufferReplacingImage:withBuffer: 的语义）——下游看到的帧
+/// 格式/尺寸/时间轴都没变，只是像素换了，被拒的概率最低。
+/// 构造失败才回退到"自有格式描述 + 墙钟时间戳"。
+- (nullable CMSampleBufferRef)nextVideoSampleBufferMatching:(CMSampleBufferRef)original {
+    if (!self.replacing) return NULL;
+
+    CVPixelBufferRef pb = [self dequeuePixelBuffer];
+    if (!pb) return NULL;
+
+    if (original) {
+        [self noteCameraSize:CGSizeMake(CVPixelBufferGetWidth(CMSampleBufferGetImageBuffer(original) ?: NULL),
+                                        CVPixelBufferGetHeight(CMSampleBufferGetImageBuffer(original) ?: NULL))];
+        CMFormatDescriptionRef fd = CMSampleBufferGetFormatDescription(original);
+        CMSampleTimingInfo timing;
+        if (fd && CMSampleBufferGetSampleTimingInfo(original, 0, &timing) == noErr) {
+            CMSampleBufferRef out = NULL;
+            OSStatus st = CMSampleBufferCreateReadyWithImageBuffer(
+                kCFAllocatorDefault, pb, fd, &timing, &out);
+            if (st == noErr && out) {
+                CVPixelBufferRelease(pb);
+                return out;                             // +1
+            }
+            [CFLogger.shared log:@"按原帧重建失败(%d)，回退自有格式描述", (int)st];
+        }
+    }
+
+    // 回退路径：自有格式描述 + 墙钟 PTS
+    CMVideoFormatDescriptionRef fd = [self.converter formatDescription];
+    if (!fd) { CVPixelBufferRelease(pb); return NULL; }
+    CMTime now = CMTimeMakeWithSeconds(CACurrentMediaTime(), 1000);
+    if (CMTimeCompare(now, self.lastPTS) <= 0) now = CMTimeAdd(self.lastPTS, CMTimeMake(1, 120));
+    self.lastPTS = now;
+    CMSampleTimingInfo timing = { CMTimeMake(1, 30), now, now };
+    CMSampleBufferRef sb = NULL;
+    OSStatus st = CMSampleBufferCreateReadyWithImageBuffer(kCFAllocatorDefault, pb, fd, &timing, &sb);
+    CVPixelBufferRelease(pb);
+    if (st != noErr || !sb) return NULL;
+    return sb;                                         // +1
+}
 
 - (CMSampleBufferRef)nextVideoSampleBuffer {
     if (!self.replacing) return NULL;
@@ -387,6 +450,19 @@ static BOOL cf_block_is_silent(CMBlockBufferRef block, size_t totalBytes) {
         CFRelease(self.lastSampleBuffer);
         self.lastSampleBuffer = NULL;
     }
+    if (self.lastPixelBuffer) {
+        CVPixelBufferRelease(self.lastPixelBuffer);
+        self.lastPixelBuffer = NULL;
+    }
+}
+
+/// 记住相机真实尺寸，让注入帧与真帧同尺寸（原版 _lastCameraSize / _originalCameraSize 的做法）
+- (void)noteCameraSize:(CGSize)size {
+    if (size.width <= 0 || size.height <= 0) return;
+    if (CGSizeEqualToSize(self.cameraSize, size)) return;
+    self.cameraSize = size;
+    self.converter.targetSize = size;      // 转换器按这个尺寸出帧
+    [CFLogger.shared log:@"相机尺寸已跟随: %.0fx%.0f", size.width, size.height];
 }
 
 - (NSData *)convertPCM:(NSData *)pcm

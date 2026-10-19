@@ -27,6 +27,10 @@ NS_ASSUME_NONNULL_BEGIN
 /// YES = 填充（等比放大裁切，默认）；NO = 适应（等比缩小留黑边）
 @property (nonatomic, assign) BOOL fillMode;
 
+/// 输出尺寸覆盖；CGSizeZero = 跟随源尺寸。
+/// 设为相机实际尺寸后，注入帧与真帧同尺寸，下游无需处理分辨率切换。
+@property (nonatomic, assign) CGSize targetSize;
+
 /// 最近一帧的输出尺寸（含旋转后的交换）
 @property (nonatomic, readonly) CGSize outputSize;
 

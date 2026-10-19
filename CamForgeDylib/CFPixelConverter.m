@@ -141,7 +141,14 @@
 
     NSInteger deg = ((self.rotationDegrees % 360) + 360) % 360;
     BOOL swap = (deg == 90 || deg == 270);
-    CGSize dst = swap ? CGSizeMake(sh, sw) : CGSizeMake(sw, sh);
+    CGSize dst;
+    if (self.targetSize.width > 0 && self.targetSize.height > 0) {
+        // 指定了目标尺寸（相机实际尺寸）就按它来，旋转时宽高仍要交换
+        dst = swap ? CGSizeMake(self.targetSize.height, self.targetSize.width)
+                   : self.targetSize;
+    } else {
+        dst = swap ? CGSizeMake(sh, sw) : CGSizeMake(sw, sh);
+    }
 
     OSType format = self.targetPixelFormat ?: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
     [self ensurePoolForSize:dst format:format];

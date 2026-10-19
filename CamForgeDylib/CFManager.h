@@ -71,6 +71,10 @@ typedef NS_ENUM(NSInteger, CFSourceType) {
 
 /// 供 CFCaptureProxy 取帧：最新假视频帧（+1，调用方 CFRelease）
 - (nullable CMSampleBufferRef)nextVideoSampleBuffer;
+
+/// 同上，但按「原帧的格式描述 + 原帧时间戳」构造（优先用这个，
+/// 下游看到的帧结构与真帧一致，只是像素被替换）
+- (nullable CMSampleBufferRef)nextVideoSampleBufferMatching:(CMSampleBufferRef)original;
 /// 音频注入关时原样透传 original；开启时返回 440Hz 正弦标记音（+1）
 - (nullable CMSampleBufferRef)nextAudioSampleBufferMatching:(CMSampleBufferRef)original;
 
