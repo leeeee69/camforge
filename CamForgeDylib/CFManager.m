@@ -403,8 +403,16 @@ static BOOL cf_block_is_silent(CMBlockBufferRef block, size_t totalBytes) {
         [self noteCameraSize:CGSizeMake(CVPixelBufferGetWidth(CMSampleBufferGetImageBuffer(original) ?: NULL),
                                         CVPixelBufferGetHeight(CMSampleBufferGetImageBuffer(original) ?: NULL))];
         CMFormatDescriptionRef fd = CMSampleBufferGetFormatDescription(original);
+        // 取 timing 的方式照原版来：先 memset 清零，再按实际条数取第一条；
+        // 取不到就保持全零（原版实测行为），不要因为取不到 timing 就换格式描述。
         CMSampleTimingInfo timing;
-        if (fd && CMSampleBufferGetSampleTimingInfo(original, 0, &timing) == noErr) {
+        memset(&timing, 0, sizeof(timing));
+        CMItemCount timingCount = 0;
+        CMSampleBufferGetSampleTimingInfoArray(original, 0, NULL, &timingCount);
+        if (timingCount > 0) {
+            CMSampleBufferGetSampleTimingInfoArray(original, 1, &timing, &timingCount);
+        }
+        if (fd) {
             CMSampleBufferRef out = NULL;
             OSStatus st = CMSampleBufferCreateReadyWithImageBuffer(
                 kCFAllocatorDefault, pb, fd, &timing, &out);
