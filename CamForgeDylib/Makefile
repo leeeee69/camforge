@@ -19,7 +19,9 @@ CamForge_FILES = \
     CFPixelConverter.m \
     CFJitterBuffer.m \
     CFLogger.m \
-    CFMenu.m
+    CFMenu.m \
+    CFMenuPanelView.m \
+    CFStreamPreview.m
 
 CamForge_CFLAGS = -fobjc-arc
 CamForge_FRAMEWORKS = UIKit AVFoundation CoreMedia CoreVideo Accelerate QuartzCore CoreImage Foundation Photos PhotosUI
