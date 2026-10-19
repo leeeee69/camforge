@@ -549,8 +549,9 @@ static BOOL cf_block_is_silent(CMBlockBufferRef block, size_t totalBytes) {
     // 非交织音频（每声道一个 buffer）时一遍式会因 bufferListOut 太小而失败。
     CMBlockBufferRef block = NULL;
     size_t sizeNeeded = 0;
+    // 注意：第 4 参 bufferListSizeOut 是「值」不是指针（bufferListOut 为 NULL 时传 0）
     OSStatus st = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
-        original, &sizeNeeded, NULL, NULL, NULL, NULL,
+        original, &sizeNeeded, NULL, 0, NULL, NULL,
         kCMBlockBufferAssureMemoryNowFlag, &block);
     if (st != noErr || !block) { CFRetain(original); return original; }
     CFRelease(block);
