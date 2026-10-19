@@ -78,6 +78,10 @@ typedef NS_ENUM(NSInteger, CFSourceType) {
 /// 音频注入关时原样透传 original；开启时返回 440Hz 正弦标记音（+1）
 - (nullable CMSampleBufferRef)nextAudioSampleBufferMatching:(CMSampleBufferRef)original;
 
+/// 音频注入（原版做法）：**原地改写 original 的音频样本**后原样返回它（+1）。
+/// 结构与真帧完全一致，只有样本值被换掉。
+- (nullable CMSampleBufferRef)injectAudioIntoOriginal:(CMSampleBufferRef)original;
+
 /// 对已运行的 session 补挂 hook（防止 App 在插件加载前就设好了 delegate）
 - (void)rescanSessionOutputs:(AVCaptureSession *)session;
 

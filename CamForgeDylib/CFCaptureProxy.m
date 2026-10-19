@@ -142,7 +142,7 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
         @try {
             injected = isVideo
                 ? [CFManager.shared nextVideoSampleBufferMatching:sampleBuffer]
-                : [CFManager.shared nextAudioSampleBufferMatching:sampleBuffer];
+                : [CFManager.shared injectAudioIntoOriginal:sampleBuffer];
         } @catch (NSException *e) {
             [CFLogger.shared log:@"取注入帧异常: %@", e.reason];
             injected = NULL;

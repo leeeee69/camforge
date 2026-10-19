@@ -81,6 +81,11 @@ static BOOL cf_block_is_silent(CMBlockBufferRef block, size_t totalBytes) {
 - (void)resetLastSampleBuffer;
 - (CVPixelBufferRef)dequeuePixelBuffer;
 - (void)noteCameraSize:(CGSize)size;
+- (BOOL)fillAudioSamples:(int16_t *)gen
+               numSamples:(CMItemCount)numSamples
+                 channels:(size_t)channels
+                sampleRate:(double)sampleRate
+      originalSampleBuffer:(CMSampleBufferRef)original;
 @end
 
 @implementation CFManager
@@ -506,110 +511,148 @@ static BOOL cf_block_is_silent(CMBlockBufferRef block, size_t totalBytes) {
 #endif
 }
 
-- (CMSampleBufferRef)nextAudioSampleBufferMatching:(CMSampleBufferRef)original {
-    if (!original) return NULL;
-    if (!self.audioReplaceEnabled) {
-        CFRetain(original);
-        return original;                                    // 透传
-    }
+/*!
+ 音频注入：**原地改写原始 sample buffer 的音频数据**，然后原样返回它。
+ 这是原版 VCamAudioCaptureProxy._injectIntoSampleBuffer: 的做法——从反汇编确认：
+   CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(orig, NULL, &abl, 24,
+        NULL, NULL, kCMBlockBufferAssureMemoryNowFlag, &block)
+   然后直接往 abl 的 mData 里写，CMSampleBuffer 对象本身不重建。
 
-    CMFormatDescriptionRef fmt = CMSampleBufferGetFormatDescription(original);
-    if (!fmt) { CFRetain(original); return original; }
+ 为什么不重建 sample buffer：重建必然带上自己的格式描述/时间戳/附件，
+ 下游（尤其走 AudioUnit 的链路）对"结构和真帧不一致"的音频帧更敏感，
+ 改写原帧则结构 100% 一致，只有样本值被换掉。
+ */
+- (nullable CMSampleBufferRef)injectAudioIntoOriginal:(CMSampleBufferRef)original {
+    if (!original) return NULL;
+
+    // 未开音频注入：原样透传
+    if (!self.audioReplaceEnabled) { CFRetain(original); return original; }
+    // 数据没就绪就别碰（强写会踩到未初始化内存）
+    if (!CMSampleBufferDataIsReady(original)) { CFRetain(original); return original; }
+
+    CMFormatDescriptionRef fd = CMSampleBufferGetFormatDescription(original);
+    if (!fd) { CFRetain(original); return original; }
     const AudioStreamBasicDescription *asbd =
-        CMAudioFormatDescriptionGetStreamBasicDescription(fmt);
+        CMAudioFormatDescriptionGetStreamBasicDescription(fd);
     if (!asbd || asbd->mSampleRate <= 0 || asbd->mChannelsPerFrame == 0) {
-        CFRetain(original);
-        return original;
+        CFRetain(original); return original;
     }
 
     CMItemCount numSamples = CMSampleBufferGetNumSamples(original);
     if (numSamples <= 0) { CFRetain(original); return original; }
 
-    size_t frameBytes = asbd->mBytesPerFrame ? asbd->mBytesPerFrame
-                                             : 2 * asbd->mChannelsPerFrame;
-    size_t totalBytes = (size_t)numSamples * frameBytes;
+    size_t channels = asbd->mChannelsPerFrame;
+    size_t totalBytes = (size_t)numSamples * channels * 2;      // s16
     if (totalBytes == 0) { CFRetain(original); return original; }
 
-    // 音频去重：原帧是静音段就不注入 —— 否则标记音会在一整段静音上连成嗡声，
-    // 既没信息量又容易听出异常。判定走抽样，几乎零开销。
+    // 取原始帧的 AudioBufferList。两遍走：先问需要多大，再真取——
+    // 非交织音频（每声道一个 buffer）时一遍式会因 bufferListOut 太小而失败。
+    CMBlockBufferRef block = NULL;
+    size_t sizeNeeded = 0;
+    OSStatus st = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
+        original, &sizeNeeded, NULL, NULL, NULL, NULL,
+        kCMBlockBufferAssureMemoryNowFlag, &block);
+    if (st != noErr || !block) { CFRetain(original); return original; }
+    CFRelease(block);
+    block = NULL;
+
+    if (sizeNeeded == 0 || sizeNeeded > 4096) { CFRetain(original); return original; }
+    AudioBufferList *abl = (AudioBufferList *)calloc(1, sizeNeeded);
+    if (!abl) { CFRetain(original); return original; }
+
+    st = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
+        original, NULL, abl, sizeNeeded, NULL, NULL,
+        kCMBlockBufferAssureMemoryNowFlag, &block);
+    if (st != noErr || !block) { free(abl); CFRetain(original); return original; }
+
+    // 生成要写入的样本（推流 PCM 优先；没有则 440Hz 标记音）
+    int16_t *gen = (int16_t *)malloc(totalBytes);
+    if (!gen) { CFRelease(block); CFRetain(original); return original; }
+
+    BOOL usedDirect = [self fillAudioSamples:gen
+                                   numSamples:numSamples
+                                     channels:channels
+                                    sampleRate:asbd->mSampleRate
+                              originalSampleBuffer:original];
+    if (!usedDirect) {
+        static double phase = 0;
+        double dphase = 2.0 * M_PI * 440.0 / asbd->mSampleRate;
+        for (CMItemCount i = 0; i < numSamples; i++) {
+            int16_t v = (int16_t)(sin(phase) * 0.3 * 32767.0);
+            phase += dphase;
+            if (phase > 2.0 * M_PI) phase -= 2.0 * M_PI;
+            for (size_t ch = 0; ch < channels; ch++) {
+                gen[(size_t)i * channels + ch] = v;
+            }
+        }
+    }
+
+    // 写进原始帧的缓冲：单缓冲=交织；多缓冲=按声道拆
+    if (abl->mNumberBuffers <= 1) {
+        size_t n = MIN(totalBytes, abl->mBuffers[0].mDataByteSize);
+        if (abl->mBuffers[0].mData && n > 0) memcpy(abl->mBuffers[0].mData, gen, n);
+    } else {
+        for (UInt32 b = 0; b < abl->mNumberBuffers && b < channels; b++) {
+            void *dst = abl->mBuffers[b].mData;
+            size_t cap = abl->mBuffers[b].mDataByteSize;
+            if (!dst || cap == 0) continue;
+            int16_t *out = (int16_t *)dst;
+            for (CMItemCount i = 0; i < numSamples; i++) {
+                if ((size_t)(i + 1) * 2 > cap) break;
+                out[i] = gen[(size_t)i * channels + b];
+            }
+        }
+    }
+
+    free(gen);
+    free(abl);
+    CFRelease(block);          // abl 里的指针在 block 释放后即失效，但已经写完了
+    CFRetain(original);
+    return original;           // +1，原对象
+}
+
+/// 用「直连」推过来的 PCM 填样本；没有推流音频返回 NO（调用方回落 440Hz）
+- (BOOL)fillAudioSamples:(int16_t *)gen
+               numSamples:(CMItemCount)numSamples
+                 channels:(size_t)channels
+                sampleRate:(double)sampleRate
+      originalSampleBuffer:(CMSampleBufferRef)original {
+    if (![self.source isKindOfClass:[CFDirectSource class]]) return NO;
+    CFDirectSource *ds = (CFDirectSource *)self.source;
+    if (!ds.hasAudio) return NO;
+
+    NSUInteger srcRate = [CFDirectSource audioSampleRate];
+    NSUInteger srcCh   = [CFDirectSource audioChannels];
+
+    // 音频去重：原帧是静音段就不注入，避免标记音在整段静音上连成嗡声
     if (self.audioDedupe) {
         CMBlockBufferRef srcBlock = CMSampleBufferGetDataBuffer(original);
-        if (cf_block_is_silent(srcBlock, totalBytes)) {
-            CFRetain(original);
-            return original;
+        if (srcBlock && cf_block_is_silent(srcBlock, (size_t)numSamples * channels * 2)) {
+            return NO;
         }
     }
 
-    CMBlockBufferRef block = NULL;
-    OSStatus st = CMBlockBufferCreateWithMemoryBlock(
-        kCFAllocatorDefault, NULL, totalBytes, kCFAllocatorDefault, NULL,
-        0, totalBytes, kCMBlockBufferAssureMemoryNowFlag, &block);
-    if (st != noErr || !block) { CFRetain(original); return original; }
+    NSUInteger srcFrames = (NSUInteger)((double)numSamples * srcRate / MAX(sampleRate, 1.0));
+    NSData *pcm = [ds takeAudioBytes:srcFrames * srcCh * 2];
+    if (pcm.length == 0) return NO;
 
-    // 440Hz 正弦标记音（研究用：听感上立刻能分辨注入是否生效）
-    // 注意：CMBlockBufferGetDataPointer(theBuffer, offset, lengthAtOffsetOut, totalLengthOut, dataPointerOut)
-    // offset 是值；totalLengthOut 在 dataPointerOut 之前
-    char *data = NULL;
-    size_t lengthAtOffset = 0, totalLengthOut = 0;
-    if (CMBlockBufferGetDataPointer(block, 0, &lengthAtOffset, &totalLengthOut, &data) == noErr && data) {
-        BOOL filled = NO;
+    NSData *conv = [self convertPCM:pcm fromRate:(int)srcRate fromCh:(int)srcCh
+                             toRate:(int)sampleRate toCh:(int)channels
+                          wantBytes:(size_t)numSamples * channels * 2];
+    if (conv.length == 0) return NO;
 
-        // 1) 优先用「直连」推过来的 PCM（PC 推什么就播什么）
-        if ([self.source isKindOfClass:[CFDirectSource class]]) {
-            CFDirectSource *ds = (CFDirectSource *)self.source;
-            if (ds.hasAudio) {
-                NSUInteger srcRate = [CFDirectSource audioSampleRate];
-                NSUInteger srcCh   = [CFDirectSource audioChannels];
-                NSUInteger dstBytesPerFrame = (asbd->mBytesPerFrame ?: (2 * asbd->mChannelsPerFrame));
-                NSUInteger dstSamples = totalBytes / (dstBytesPerFrame ?: 1);
-                NSUInteger srcFrames  = (NSUInteger)((double)dstSamples * srcRate /
-                                                     MAX(asbd->mSampleRate, 1.0));
-                NSData *pcm = [ds takeAudioBytes:srcFrames * srcCh * 2];
-                if (pcm.length) {
-                    NSData *conv = [self convertPCM:pcm
-                                           fromRate:(int)srcRate fromCh:(int)srcCh
-                                             toRate:(int)asbd->mSampleRate
-                                               toCh:(int)asbd->mChannelsPerFrame
-                                          wantBytes:totalBytes];
-                    if (conv.length) {
-                        size_t n = MIN(conv.length, totalBytes);
-                        memcpy(data, conv.bytes, n);
-                        if (n < totalBytes) memset(data + n, 0, totalBytes - n);   // 尾部补静音
-                        filled = YES;
-                        [CFLogger.shared incDirectAudio];
-                    }
-                }
-            }
-        }
-
-        // 2) 没有推流音频 → 440Hz 标记音（研究用：听感上一秒分辨注入是否生效）
-        if (!filled) {
-            static double phase = 0;
-            double dphase = 2.0 * M_PI * 440.0 / asbd->mSampleRate;
-            for (CMItemCount i = 0; i < numSamples; i++) {
-                int16_t v = (int16_t)(sin(phase) * 0.3 * 32767.0);
-                phase += dphase;
-                if (phase > 2.0 * M_PI) phase -= 2.0 * M_PI;
-                for (UInt32 ch = 0; ch < asbd->mChannelsPerFrame; ch++) {
-                    memcpy(data + ((size_t)i * asbd->mChannelsPerFrame + ch) * 2, &v, 2);
-                }
-            }
-        }
+    size_t n = MIN(conv.length, (size_t)numSamples * channels * 2);
+    memcpy(gen, conv.bytes, n);
+    if (n < (size_t)numSamples * channels * 2) {
+        memset((uint8_t *)gen + n, 0, (size_t)numSamples * channels * 2 - n);   // 尾部补静音
     }
+    [CFLogger.shared incDirectAudio];
+    return YES;
+}
 
-    CMTime pts = CMSampleBufferGetPresentationTimeStamp(original);
-    CMTime dur = CMSampleBufferGetDuration(original);
-    if (CMTIME_IS_INVALID(dur) || CMTIME_IS_INDEFINITE(dur)) {
-        dur = CMTimeMake(1, (int64_t)asbd->mSampleRate);
-    }
-    CMSampleTimingInfo timing = { dur, pts, pts };
-
-    CMSampleBufferRef sb = NULL;
-    st = CMSampleBufferCreate(kCFAllocatorDefault, block, true, NULL, NULL,
-                              fmt, numSamples, 1, &timing, 0, NULL, &sb);
-    CFRelease(block);
-    if (st != noErr || !sb) { CFRetain(original); return original; }
-    return sb;   // +1
+- (CMSampleBufferRef)nextAudioSampleBufferMatching:(CMSampleBufferRef)original {
+    // 兼容旧调用：统一走原地改写
+    return [self injectAudioIntoOriginal:original];
 }
 
 #pragma mark - 补挂 hook
